@@ -1,5 +1,5 @@
 import connectwithinfinitydb as db
-import verifysignals
+import validatesignals
 import MetaTrader5 as mt5
 import os
 import shutil
@@ -452,9 +452,9 @@ async def execute_fetch_bouncestream_signals():
         return False
     log_and_print("Successfully fetched bouncestream signals", "SUCCESS")
     return True
-def run_verifysignals_main():
+def run_validatesignals_main():
     try:
-        verifysignals.main()
+        validatesignals.main()
     except Exception as e:
         print(f"Error in analysechart_m (M15): {e}")
 
@@ -578,13 +578,14 @@ class MT5Manager:
 
 # Programme Fetcher Class
 class ProgrammeFetcher:
-    """Manages fetching and validating programme data, and MT5 operations."""
     def __init__(self):
         self.config = ConfigManager()
         self.mt5_manager = MT5Manager()
         self.processed_programme_ids: set[str] = set()
-        self.total_signals_loaded: int = 0  # Track total signals loaded
-        self.total_failed_orders: int = 0   # Track total failed orders
+        self.total_signals_loaded: int = 0
+        self.total_failed_orders: int = 0
+        self.total_alltimeframes_orders: int = 0  # New counter for alltimeframes orders
+        self.total_priority_timeframes_orders: int = 0  
 
     def normalize_row(self, row: Dict) -> Dict:
         """Normalize row data to handle string 'None' values and ensure correct types."""
@@ -629,16 +630,19 @@ class ProgrammeFetcher:
         broker_server = record['broker_server']
         broker_loginid = str(record['broker_loginid']) if record['broker_loginid'] else ''
         broker_password = str(record['broker_password']) if record['broker_password'] else ''
+        programme_timeframe = record.get('programme_timeframe', None)
 
         log_and_print(f"Validating record: programme_id={programme_id}, user_id={user_id}, subaccount_id={subaccount_id}, "
-                      f"programme={programme}, broker={broker}", "DEBUG")
+                    f"programme={programme}, broker={broker}, programme_timeframe={programme_timeframe}", "DEBUG")
 
         # Validate fields
         programme = self.config.validate_field('programme', programme, self.config.valid_programmes, 'programme')
         broker = self.config.validate_field('broker', broker, self.config.valid_brokers, 'broker')
+        programme_timeframe = self.config.validate_field('programme_timeframe', programme_timeframe, 
+                                                        ['priority_timeframe', 'alltimeframes'], 'programme_timeframe')
 
-        if not all([programme, broker]):
-            log_and_print(f"Skipping record: programme_id={programme_id}, invalid programme or broker", "DEBUG")
+        if not all([programme, broker, programme_timeframe]):
+            log_and_print(f"Skipping record: programme_id={programme_id}, invalid programme, broker, or programme_timeframe", "DEBUG")
             return None
 
         if programme_id in self.processed_programme_ids:
@@ -661,11 +665,12 @@ class ProgrammeFetcher:
             'broker': broker,
             'broker_loginid': broker_loginid,
             'broker_password': broker_password,
-            'broker_server': broker_server
+            'broker_server': broker_server,
+            'programme_timeframe': programme_timeframe
         }
 
     async def fetch_user_programmes(self) -> Optional[List[Dict]]:
-        """Fetch user programmes from the user_programmes table, including broker details."""
+        """Fetch user programmes from the user_programmes table, including broker details and programme_timeframe."""
         sql_query = """
             SELECT 
                 u.id AS user_id, 
@@ -677,7 +682,8 @@ class ProgrammeFetcher:
                 up.broker,
                 up.broker_server,
                 up.broker_loginid,
-                up.broker_password
+                up.broker_password,
+                up.programme_timeframe
             FROM 
                 users u
             LEFT JOIN
@@ -764,6 +770,71 @@ class ProgrammeFetcher:
             log_and_print(f"Exception while adding symbols for {account_key}: {str(e)}", "ERROR")
             return False
 
+    async def batch_update_programme_startdate(self, programme_ids: List[str]) -> int:
+        """Batch update programmetrade_startdate for programmes with successful orders if the date is NULL or empty."""
+        log_and_print(f"Received {len(programme_ids)} programme IDs for start date update", "DEBUG")
+        if not programme_ids:
+            log_and_print("No programme IDs to update for programmetrade_startdate", "INFO")
+            return 0
+
+        update_queries = []
+        current_date = datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S')
+
+        for programme_id in programme_ids:
+            # Verify programme_id exists and programmetrade_startdate is NULL
+            check_query = f"""
+                SELECT programmetrade_startdate
+                FROM user_programmes
+                WHERE id = '{programme_id}'
+            """
+            log_and_print(f"Verifying programme_id={programme_id} with query: {check_query}", "DEBUG")
+            result = db.execute_query(check_query)
+            
+            if result['status'] != 'success' or not isinstance(result['results'], list) or not result['results']:
+                log_and_print(f"Skipping update for programme_id={programme_id}: ID does not exist or query failed", "ERROR")
+                continue
+
+            current_startdate = result['results'][0].get('programmetrade_startdate')
+            if current_startdate is not None:
+                log_and_print(f"Skipping update for programme_id={programme_id}: programmetrade_startdate already set to {current_startdate}", "INFO")
+                continue
+
+            # Build update query
+            sql_query = f"""
+                UPDATE user_programmes
+                SET programmetrade_startdate = '{current_date}'
+                WHERE id = '{programme_id}' AND (programmetrade_startdate IS NULL OR programmetrade_startdate = '')
+            """
+            update_queries.append((sql_query, programme_id))
+
+        if not update_queries:
+            log_and_print("No valid updates to process for programmetrade_startdate", "WARNING")
+            return 0
+
+        log_and_print(f"Executing {len(update_queries)} batched start date update queries", "INFO")
+        success_count = 0
+        for sql_query, programme_id in update_queries:
+            for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+                log_and_print(f"Executing start date update query (attempt {attempt}/{RETRY_MAX_ATTEMPTS}) for programme_id={programme_id}: {sql_query}", "DEBUG")
+                result = db.execute_query(sql_query)
+                if result['status'] == 'success' and isinstance(result['results'], dict) and result['results'].get('affected_rows', 0) > 0:
+                    log_and_print(f"Successfully updated programmetrade_startdate for programme_id={programme_id}", "SUCCESS")
+                    success_count += 1
+                    break
+                else:
+                    error_message = result.get('message', 'No message provided')
+                    affected_rows = result['results'].get('affected_rows', 0) if isinstance(result['results'], dict) else 'N/A'
+                    log_and_print(f"Failed to update programme_id={programme_id} on attempt {attempt}: {error_message}, affected_rows={affected_rows}", "ERROR")
+                    if attempt < RETRY_MAX_ATTEMPTS:
+                        delay = RETRY_DELAY * (2 ** (attempt - 1))
+                        log_and_print(f"Retrying after {delay} seconds...", "INFO")
+                        await asyncio.sleep(delay)
+                    else:
+                        log_and_print(f"Max retries reached for programme_id={programme_id}. Start date update failed.", "ERROR")
+
+        log_and_print(f"Successfully updated programmetrade_startdate for {success_count}/{len(update_queries)} programmes", "INFO")
+        return success_count
+
     async def process_account_initialization(self, valid_accounts: List[Dict]) -> tuple[int, int, int, int]:
         """Process MT5 initialization, symbol addition, and order placement for valid bouncestream accounts in batches."""
         log_and_print("===== Processing MT5 Initialization, Symbol Addition, and Order Placement for Bouncestream Accounts =====", "TITLE")
@@ -795,6 +866,36 @@ class ProgrammeFetcher:
             if symbol not in symbol_signals:
                 symbol_signals[symbol] = []
             symbol_signals[symbol].append(signal)
+
+        # Update programmetrade_startdate for all valid accounts before processing
+        programme_ids_to_update = []
+        for account in valid_accounts:
+            programme_id = account['programme_id']
+            check_query = f"""
+                SELECT programmetrade_startdate
+                FROM user_programmes
+                WHERE id = '{programme_id}'
+            """
+            log_and_print(f"Checking programmetrade_startdate for programme_id={programme_id}", "DEBUG")
+            result = db.execute_query(check_query)
+            
+            if result['status'] != 'success' or not isinstance(result['results'], list) or not result['results']:
+                log_and_print(f"Skipping start date check for programme_id={programme_id}: ID does not exist or query failed", "ERROR")
+                continue
+
+            current_startdate = result['results'][0].get('programmetrade_startdate')
+            if current_startdate is not None:
+                log_and_print(f"programmetrade_startdate already set for programme_id={programme_id}: {current_startdate}", "INFO")
+                continue
+
+            programme_ids_to_update.append(programme_id)
+
+        if programme_ids_to_update:
+            log_and_print(f"Updating programmetrade_startdate for {len(programme_ids_to_update)} programmes", "INFO")
+            startdate_updated = await self.batch_update_programme_startdate(programme_ids_to_update)
+            log_and_print(f"Updated programmetrade_startdate for {startdate_updated} programmes", "SUCCESS" if startdate_updated > 0 else "WARNING")
+        else:
+            log_and_print("No programmes need programmetrade_startdate updates", "INFO")
 
         accounts_logged_in = 0
         accounts_with_symbols = 0
@@ -951,6 +1052,249 @@ class ProgrammeFetcher:
             log_and_print(f"Successfully saved failed order for {symbol} to {output_path} (Category: {error_category})", "SUCCESS")
         except Exception as e:
             log_and_print(f"Error saving failed order for {symbol} to {output_path}: {str(e)}", "ERROR")
+
+    async def alltimeframesorder(self, account: Dict, terminal_path: str, signals: List[Dict], available_symbols: List[str]) -> tuple[int, int]:
+        """Place one order per timeframe (15m, 30m, 1h, 4h) for each symbol if available, except M5 unless no other timeframes exist."""
+        account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
+        log_and_print(f"===== Placing All-Timeframes Orders for {account_key} =====", "TITLE")
+
+        # Define timeframe order (excluding M5 unless necessary)
+        timeframe_order = ['15minutes', '30minutes', '1hour', '4hours', '5minutes']
+        log_and_print(f"Timeframe order for alltimeframes: {', '.join(timeframe_order)}", "INFO")
+
+        # Initialize MT5 for the account
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                if self.mt5_manager.initialize_mt5(
+                    server=account['broker_server'],
+                    login=account['broker_loginid'],
+                    password=account['broker_password'],
+                    terminal_path=terminal_path
+                ):
+                    log_and_print(f"MT5 initialization successful for {account_key} on attempt {attempt}", "SUCCESS")
+                    break
+                else:
+                    error_message = f"MT5 initialization failed: {thread_local.mt5.last_error()}"
+                    log_and_print(f"MT5 initialization failed for {account_key} on attempt {attempt}: {error_message}", "ERROR")
+                    if attempt == MAX_RETRIES:
+                        self.save_account_order_error(account_key, "N/A", error_message)
+                        return 0, 0
+                    log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
+                    await asyncio.sleep(MT5_RETRY_DELAY)
+            except Exception as e:
+                error_message = f"Exception during MT5 initialization: {str(e)}"
+                log_and_print(f"Exception during MT5 initialization for {account_key} on attempt {attempt}: {error_message}", "ERROR")
+                if attempt == MAX_RETRIES:
+                    self.save_account_order_error(account_key, "N/A", error_message)
+                    return 0, 0
+                log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
+                await asyncio.sleep(MT5_RETRY_DELAY)
+
+        # Get account balance
+        try:
+            account_info = thread_local.mt5.account_info()
+            if account_info is None:
+                error_message = "Failed to retrieve account info"
+                log_and_print(f"Error for {account_key}: {error_message}", "ERROR")
+                self.save_account_order_error(account_key, "N/A", error_message)
+                return 0, 0
+            balance = float(account_info.balance)
+            log_and_print(f"Account balance for {account_key}: {balance}", "INFO")
+        except Exception as e:
+            error_message = f"Error retrieving account balance: {str(e)}"
+            log_and_print(f"Error for {account_key}: {error_message}", "ERROR")
+            self.save_account_order_error(account_key, "N/A", error_message)
+            return 0, 0
+
+        # Determine allowed risk levels and multipliers based on balance
+        allowed_risk_levels = []
+        risk_multipliers = {}
+        if balance < 96:
+            allowed_risk_levels = [4.0]
+            risk_multipliers[4.0] = 1
+        elif balance >= 96 and balance < 144:
+            allowed_risk_levels = [4.0, 8.0]
+            risk_multipliers[4.0] = 4
+            risk_multipliers[8.0] = 1
+        else:
+            allowed_risk_levels = [4.0, 8.0, 16.0]
+            base_multiplier = 3 + max(0, int((balance - 144) // 48))
+            risk_multipliers[4.0] = base_multiplier
+            risk_multipliers[8.0] = 2
+            risk_multipliers[16.0] = 1
+
+        log_and_print(f"Allowed risk levels for {account_key}: {allowed_risk_levels}", "INFO")
+        log_and_print(f"Risk multipliers for {account_key}: {risk_multipliers}", "INFO")
+
+        added_symbols = []
+        failed_symbols = []
+        pending_orders_placed = []
+
+        # Step 1: Add symbols to Market Watch
+        unique_symbols = list(set(signal['pair'] for signal in signals))
+        for json_symbol in unique_symbols:
+            try:
+                server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
+                if server_symbol is None:
+                    error_message = "No server symbol match found"
+                    log_and_print(f"Skipping {json_symbol} for {account_key}: {error_message}", "ERROR")
+                    failed_symbols.append(json_symbol)
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
+                    continue
+
+                for attempt in range(1, MAX_RETRIES + 1):
+                    if thread_local.mt5.symbol_select(server_symbol, True):
+                        log_and_print(f"Symbol {server_symbol} selected directly in Market Watch for {account_key}", "SUCCESS")
+                        added_symbols.append(server_symbol)
+                        break
+                    else:
+                        log_and_print(f"Direct selection of {server_symbol} failed for {account_key}, attempting test order on attempt {attempt}", "WARNING")
+                        if self.place_test_order(server_symbol):
+                            log_and_print(f"Symbol {server_symbol} added to Market Watch via test order for {account_key}", "SUCCESS")
+                            added_symbols.append(server_symbol)
+                            break
+                        else:
+                            log_and_print(f"Attempt {attempt}/{MAX_RETRIES}: Test order for {server_symbol} failed for {account_key}", "WARNING")
+                            if attempt == MAX_RETRIES:
+                                error_message = f"Failed to add {server_symbol} to Market Watch after retries: {thread_local.mt5.last_error()}"
+                                log_and_print(error_message, "ERROR")
+                                failed_symbols.append(json_symbol)
+                                self.save_account_order_error(account_key, json_symbol, error_message)
+                                self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
+                                continue
+                            log_and_print(f"Retrying test order after {MT5_RETRY_DELAY} seconds...", "INFO")
+                            await asyncio.sleep(MT5_RETRY_DELAY)
+
+            except Exception as e:
+                error_message = f"Error processing symbol {json_symbol}: {str(e)}"
+                log_and_print(error_message, "ERROR")
+                failed_symbols.append(json_symbol)
+                self.save_account_order_error(account_key, json_symbol, error_message)
+                self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
+
+        # Step 2: Group signals by symbol
+        symbol_signals = {}
+        for signal in signals:
+            symbol = signal['pair'].lower()
+            if symbol not in symbol_signals:
+                symbol_signals[symbol] = []
+            signal_allowed_risk = float(signal.get('allowed_risk', 0.0)) if signal.get('allowed_risk') is not None else 0.0
+            if signal_allowed_risk in allowed_risk_levels:
+                symbol_signals[symbol].append(signal)
+
+        # Step 3: Process signals per symbol
+        for json_symbol in unique_symbols:
+            server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
+            if server_symbol is None or server_symbol not in added_symbols:
+                log_and_print(f"Skipping orders for {json_symbol} (server: {server_symbol}) as it was not added to Market Watch", "WARNING")
+                continue
+
+            log_and_print(f"Processing orders for symbol {json_symbol} (server: {server_symbol})", "INFO")
+
+            # Get signals for this symbol
+            symbol_specific_signals = symbol_signals.get(json_symbol.lower(), [])
+
+            # Group signals by timeframe
+            signals_by_timeframe = {}
+            for signal in symbol_specific_signals:
+                timeframe = signal['timeframe'].lower().replace('4hour', '4hours')
+                if timeframe not in signals_by_timeframe:
+                    signals_by_timeframe[timeframe] = []
+                signals_by_timeframe[timeframe].append(signal)
+
+            # Check if any non-M5 timeframes exist
+            has_non_m5 = any(tf in signals_by_timeframe for tf in ['15minutes', '30minutes', '1hour', '4hours'])
+
+            # Process one order per timeframe (15m, 30m, 1h, 4h), or M5 only if no others
+            for timeframe in timeframe_order:
+                if timeframe == '5minutes' and has_non_m5:
+                    log_and_print(f"Skipping M5 orders for {json_symbol} as other timeframes are available", "INFO")
+                    continue
+                if timeframe not in signals_by_timeframe:
+                    log_and_print(f"No signals for {json_symbol} on {timeframe}", "INFO")
+                    continue
+
+                log_and_print(f"Processing one order for {json_symbol} on {timeframe}", "INFO")
+                signal = signals_by_timeframe[timeframe][0]  # Take the first signal for this timeframe
+
+                try:
+                    signal_allowed_risk = float(signal.get('allowed_risk', 0.0)) if signal.get('allowed_risk') is not None else 0.0
+                    if signal_allowed_risk not in allowed_risk_levels:
+                        error_message = f"Signal risk {signal_allowed_risk} not allowed for account balance {balance}"
+                        log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "WARNING")
+                        self.save_account_order_error(account_key, json_symbol, error_message)
+                        self.total_failed_orders += 1
+                        continue
+
+                    order_type = signal['order_type']
+                    entry_price = signal['entry_price']
+                    profit_price = signal['profit_price'] if signal['profit_price'] else None
+                    stop_loss = signal['exit_price'] if signal['exit_price'] else None
+                    lot_size = signal['lot_size']
+                    multiplier = risk_multipliers.get(signal_allowed_risk, 1)
+                    adjusted_lot_size = float(lot_size) * multiplier
+
+                    # Pre-validate signal data
+                    if not all([json_symbol, order_type, entry_price, lot_size]):
+                        error_message = "Invalid signal data: Missing required fields"
+                        log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                        self.save_account_order_error(account_key, json_symbol, error_message)
+                        self.total_failed_orders += 1
+                        continue
+                    if order_type not in ['buy_limit', 'sell_limit']:
+                        error_message = f"Unsupported order type {order_type}"
+                        log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                        self.save_account_order_error(account_key, json_symbol, error_message)
+                        self.total_failed_orders += 1
+                        continue
+                    if adjusted_lot_size <= 0.0:
+                        error_message = f"Invalid adjusted lot size {adjusted_lot_size} (original: {lot_size}, multiplier: {multiplier})"
+                        log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                        self.save_account_order_error(account_key, json_symbol, error_message)
+                        self.total_failed_orders += 1
+                        continue
+
+                    success, order_id, error_message, error_category = self.place_pending_order(
+                        server_symbol, order_type, entry_price, profit_price, stop_loss, adjusted_lot_size, signal_allowed_risk
+                    )
+                    if success:
+                        pending_orders_placed.append((server_symbol, order_id, order_type, entry_price, profit_price, stop_loss, signal_allowed_risk, multiplier))
+                        self.total_alltimeframes_orders += 1  # Increment alltimeframes counter
+                        log_and_print(f"Order placed for {json_symbol} ({timeframe}) for {account_key}: {order_type} at {entry_price}, lot_size={adjusted_lot_size} (multiplier={multiplier})", "SUCCESS")
+                    else:
+                        log_and_print(f"Failed to place order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                        failed_symbols.append(json_symbol)
+                        self.save_account_order_error(account_key, server_symbol, error_message)
+                        self.total_failed_orders += 1
+                        self.save_failed_orders(
+                            server_symbol, order_type, entry_price, profit_price, stop_loss,
+                            adjusted_lot_size, signal_allowed_risk, error_message, error_category
+                        )
+
+                except Exception as e:
+                    error_message = f"Error processing signal for {json_symbol} ({timeframe}): {str(e)}"
+                    log_and_print(error_message, "ERROR")
+                    failed_symbols.append(json_symbol)
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += 1
+
+        # Log summary
+        log_and_print(f"===== All-Timeframes Order Placement Summary for {account_key} =====", "TITLE")
+        if added_symbols:
+            log_and_print(f"Symbols added to Market Watch: {', '.join(added_symbols)}", "SUCCESS")
+        if failed_symbols:
+            log_and_print(f"Symbols failed to add or process: {', '.join(set(failed_symbols))}", "ERROR")
+        if pending_orders_placed:
+            log_and_print(
+                f"Pending orders placed: {', '.join([f'{sym} ({otype} at {entry}, TP {tp}, SL {sl}, Risk {risk}, Multiplier {multi})' for sym, oid, otype, entry, tp, sl, risk, multi in pending_orders_placed])}",
+                "SUCCESS"
+            )
+        else:
+            log_and_print("No pending orders placed", "INFO")
+        log_and_print(f"Total: {len(added_symbols)} symbols added, {len(set(failed_symbols))} failed, {len(pending_orders_placed)} pending orders placed", "INFO")
+
+        return len(added_symbols), len(pending_orders_placed)
 
     def place_pending_order(self, symbol: str, order_type: str, entry_price: float, profit_price: float, stop_loss: float, 
                         lot_size: float, allowed_risk: float) -> tuple[bool, Optional[int], Optional[str], Optional[str]]:
@@ -1140,9 +1484,21 @@ class ProgrammeFetcher:
             log_and_print(f"Error saving to {output_path}: {str(e)}", "ERROR")
 
     async def place_orders_for_account(self, account: Dict, terminal_path: str, signals: List[Dict], available_symbols: List[str]) -> tuple[int, int]:
-        """Place pending orders for a valid account based on provided signals."""
+        """Place pending orders for a valid account based on provided signals, using priority_timeframe or alltimeframes logic."""
+        programme_timeframe = account.get('programme_timeframe', 'priority_timeframe')
+        log_and_print(f"Using {programme_timeframe} order placement strategy for account", "INFO")
+
+        if programme_timeframe == 'alltimeframes':
+            symbols_added, orders_placed = await self.alltimeframesorder(account, terminal_path, signals, available_symbols)
+            return symbols_added, orders_placed
+        
+        # Original priority_timeframe logic
         account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
-        log_and_print(f"===== Placing Pending Orders for {account_key} =====", "TITLE")
+        log_and_print(f"===== Placing Priority-Timeframe Orders for {account_key} =====", "TITLE")
+
+        # Define timeframe priority order
+        timeframe_priority = ['15minutes', '4hours', '1hour', '30minutes', '5minutes']
+        log_and_print(f"Timeframe priority order: {', '.join(timeframe_priority)}", "INFO")
 
         # Initialize MT5 for the account
         for attempt in range(1, MAX_RETRIES + 1):
@@ -1171,6 +1527,42 @@ class ProgrammeFetcher:
                     return 0, 0
                 log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
                 await asyncio.sleep(MT5_RETRY_DELAY)
+
+        # Get account balance
+        try:
+            account_info = thread_local.mt5.account_info()
+            if account_info is None:
+                error_message = "Failed to retrieve account info"
+                log_and_print(f"Error for {account_key}: {error_message}", "ERROR")
+                self.save_account_order_error(account_key, "N/A", error_message)
+                return 0, 0
+            balance = float(account_info.balance)
+            log_and_print(f"Account balance for {account_key}: {balance}", "INFO")
+        except Exception as e:
+            error_message = f"Error retrieving account balance: {str(e)}"
+            log_and_print(f"Error for {account_key}: {error_message}", "ERROR")
+            self.save_account_order_error(account_key, "N/A", error_message)
+            return 0, 0
+
+        # Determine allowed risk levels and multipliers based on balance
+        allowed_risk_levels = []
+        risk_multipliers = {}
+        if balance < 96:
+            allowed_risk_levels = [4.0]
+            risk_multipliers[4.0] = 1
+        elif balance >= 96 and balance < 144:
+            allowed_risk_levels = [4.0, 8.0]
+            risk_multipliers[4.0] = 4
+            risk_multipliers[8.0] = 1
+        else:
+            allowed_risk_levels = [4.0, 8.0, 16.0]
+            base_multiplier = 3 + max(0, int((balance - 144) // 48))
+            risk_multipliers[4.0] = base_multiplier
+            risk_multipliers[8.0] = 2
+            risk_multipliers[16.0] = 1
+
+        log_and_print(f"Allowed risk levels for {account_key}: {allowed_risk_levels}", "INFO")
+        log_and_print(f"Risk multipliers for {account_key}: {risk_multipliers}", "INFO")
 
         added_symbols = []
         failed_symbols = []
@@ -1219,83 +1611,121 @@ class ProgrammeFetcher:
                 self.save_account_order_error(account_key, json_symbol, error_message)
                 self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
 
-        # Step 2: Place pending orders (signals processed externally in batches)
+        # Step 2: Group signals by symbol
+        symbol_signals = {}
         for signal in signals:
-            try:
-                json_symbol = signal['pair']
-                order_type = signal['order_type']
-                entry_price = signal['entry_price']
-                profit_price = signal['profit_price'] if signal['profit_price'] else None
-                stop_loss = signal['exit_price'] if signal['exit_price'] else None
-                lot_size = signal['lot_size']
-                allowed_risk = signal['allowed_risk'] if signal.get('allowed_risk') is not None else None
+            symbol = signal['pair'].lower()
+            if symbol not in symbol_signals:
+                symbol_signals[symbol] = []
+            signal_allowed_risk = float(signal.get('allowed_risk', 0.0)) if signal.get('allowed_risk') is not None else 0.0
+            if signal_allowed_risk in allowed_risk_levels:
+                symbol_signals[symbol].append(signal)
 
-                # Pre-validate signal data
-                if not all([json_symbol, order_type, entry_price, lot_size]):
-                    error_message = "Invalid signal data: Missing required fields"
-                    log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
-                    self.save_account_order_error(account_key, json_symbol, error_message)
-                    self.total_failed_orders += 1
-                    continue
-                if order_type not in ['buy_limit', 'sell_limit']:
-                    error_message = f"Unsupported order type {order_type}"
-                    log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
-                    self.save_account_order_error(account_key, json_symbol, error_message)
-                    self.total_failed_orders += 1
-                    continue
-                if lot_size <= 0.0:
-                    error_message = f"Invalid lot size {lot_size}"
-                    log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
-                    self.save_account_order_error(account_key, json_symbol, error_message)
-                    self.total_failed_orders += 1
-                    continue
+        # Step 3: Process signals per symbol, respecting timeframe priority
+        for json_symbol in unique_symbols:
+            server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
+            if server_symbol is None or server_symbol not in added_symbols:
+                log_and_print(f"Skipping orders for {json_symbol} (server: {server_symbol}) as it was not added to Market Watch", "WARNING")
+                continue
 
-                server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
-                if server_symbol is None:
-                    error_message = "No server symbol match found"
-                    log_and_print(f"Skipping pending order for {json_symbol} for {account_key}: {error_message}", "WARNING")
-                    failed_symbols.append(json_symbol)
-                    self.save_account_order_error(account_key, json_symbol, error_message)
-                    self.total_failed_orders += 1
-                    continue
+            log_and_print(f"Processing orders for symbol {json_symbol} (server: {server_symbol})", "INFO")
 
-                if server_symbol in added_symbols:
-                    success, order_id, error_message, error_category = self.place_pending_order(
-                        server_symbol, order_type, entry_price, profit_price, stop_loss, lot_size, allowed_risk
-                    )
-                    if success:
-                        pending_orders_placed.append((server_symbol, order_id, order_type, entry_price, profit_price, stop_loss, allowed_risk))
-                    else:
-                        log_and_print(f"Failed to place pending order for {server_symbol} for {account_key}: {error_message}", "ERROR")
-                        failed_symbols.append(json_symbol)
-                        self.save_account_order_error(account_key, server_symbol, error_message)
-                        self.total_failed_orders += 1
-                        self.save_failed_orders(
-                            server_symbol, order_type, entry_price, profit_price, stop_loss, 
-                            lot_size, allowed_risk, error_message, error_category
-                        )
-                else:
-                    error_message = f"Symbol {server_symbol} not added to Market Watch"
-                    log_and_print(f"Skipping pending order for {server_symbol} for {account_key}: {error_message}", "WARNING")
-                    self.save_account_order_error(account_key, server_symbol, error_message)
-                    self.total_failed_orders += 1
+            # Get signals for this symbol
+            symbol_specific_signals = symbol_signals.get(json_symbol.lower(), [])
 
-            except Exception as e:
-                error_message = f"Error processing signal for {json_symbol}: {str(e)}"
-                log_and_print(error_message, "ERROR")
-                failed_symbols.append(json_symbol)
-                self.save_account_order_error(account_key, json_symbol, error_message)
-                self.total_failed_orders += 1
+            # Group signals by timeframe
+            signals_by_timeframe = {}
+            for signal in symbol_specific_signals:
+                timeframe = signal['timeframe'].lower().replace('4hour', '4hours')
+                if timeframe not in signals_by_timeframe:
+                    signals_by_timeframe[timeframe] = []
+                signals_by_timeframe[timeframe].append(signal)
+
+            # Process signals based on timeframe priority
+            signals_processed = False
+            for timeframe in timeframe_priority:
+                normalized_timeframe = timeframe.lower().replace('4hour', '4hours')
+                if normalized_timeframe in signals_by_timeframe:
+                    log_and_print(f"Found {len(signals_by_timeframe[normalized_timeframe])} signals for {json_symbol} on {timeframe}, processing...", "INFO")
+                    for signal in signals_by_timeframe[normalized_timeframe]:
+                        try:
+                            signal_allowed_risk = float(signal.get('allowed_risk', 0.0)) if signal.get('allowed_risk') is not None else 0.0
+                            if signal_allowed_risk not in allowed_risk_levels:
+                                error_message = f"Signal risk {signal_allowed_risk} not allowed for account balance {balance}"
+                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "WARNING")
+                                self.save_account_order_error(account_key, json_symbol, error_message)
+                                self.total_failed_orders += 1
+                                continue
+
+                            order_type = signal['order_type']
+                            entry_price = signal['entry_price']
+                            profit_price = signal['profit_price'] if signal['profit_price'] else None
+                            stop_loss = signal['exit_price'] if signal['exit_price'] else None
+                            lot_size = signal['lot_size']
+                            multiplier = risk_multipliers.get(signal_allowed_risk, 1)
+                            adjusted_lot_size = float(lot_size) * multiplier
+
+                            # Pre-validate signal data
+                            if not all([json_symbol, order_type, entry_price, lot_size]):
+                                error_message = "Invalid signal data: Missing required fields"
+                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                                self.save_account_order_error(account_key, json_symbol, error_message)
+                                self.total_failed_orders += 1
+                                continue
+                            if order_type not in ['buy_limit', 'sell_limit']:
+                                error_message = f"Unsupported order type {order_type}"
+                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                                self.save_account_order_error(account_key, json_symbol, error_message)
+                                self.total_failed_orders += 1
+                                continue
+                            if adjusted_lot_size <= 0.0:
+                                error_message = f"Invalid adjusted lot size {adjusted_lot_size} (original: {lot_size}, multiplier: {multiplier})"
+                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                                self.save_account_order_error(account_key, json_symbol, error_message)
+                                self.total_failed_orders += 1
+                                continue
+
+                            success, order_id, error_message, error_category = self.place_pending_order(
+                                server_symbol, order_type, entry_price, profit_price, stop_loss, adjusted_lot_size, signal_allowed_risk
+                            )
+                            if success:
+                                pending_orders_placed.append((server_symbol, order_id, order_type, entry_price, profit_price, stop_loss, signal_allowed_risk, multiplier))
+                                self.total_priority_timeframes_orders += 1  # Increment priority timeframes counter
+                                log_and_print(f"Order placed for {json_symbol} ({timeframe}) for {account_key}: {order_type} at {entry_price}, lot_size={adjusted_lot_size} (multiplier={multiplier})", "SUCCESS")
+                            else:
+                                log_and_print(f"Failed to place order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
+                                failed_symbols.append(json_symbol)
+                                self.save_account_order_error(account_key, server_symbol, error_message)
+                                self.total_failed_orders += 1
+                                self.save_failed_orders(
+                                    server_symbol, order_type, entry_price, profit_price, stop_loss,
+                                    adjusted_lot_size, signal_allowed_risk, error_message, error_category
+                                )
+
+                        except Exception as e:
+                            error_message = f"Error processing signal for {json_symbol} ({timeframe}): {str(e)}"
+                            log_and_print(error_message, "ERROR")
+                            failed_symbols.append(json_symbol)
+                            self.save_account_order_error(account_key, json_symbol, error_message)
+                            self.total_failed_orders += 1
+
+                    # Mark signals as processed for this symbol and skip other timeframes
+                    signals_processed = True
+                    log_and_print(f"Completed processing {timeframe} signals for {json_symbol}, skipping other timeframes", "INFO")
+                    break
+
+                if not signals_processed:
+                    log_and_print(f"No valid signals found for {json_symbol} in any priority timeframe", "WARNING")
 
         # Log summary
-        log_and_print(f"===== Order Placement Summary for {account_key} =====", "TITLE")
+        log_and_print(f"===== Priority-Timeframe Order Placement Summary for {account_key} =====", "TITLE")
         if added_symbols:
             log_and_print(f"Symbols added to Market Watch: {', '.join(added_symbols)}", "SUCCESS")
         if failed_symbols:
             log_and_print(f"Symbols failed to add or process: {', '.join(set(failed_symbols))}", "ERROR")
         if pending_orders_placed:
             log_and_print(
-                f"Pending orders placed: {', '.join([f'{sym} ({otype} at {entry}, TP {tp}, SL {sl}, Risk {risk})' for sym, oid, otype, entry, tp, sl, risk in pending_orders_placed])}",
+                f"Pending orders placed: {', '.join([f'{sym} ({otype} at {entry}, TP {tp}, SL {sl}, Risk {risk}, Multiplier {multi})' for sym, oid, otype, entry, tp, sl, risk, multi in pending_orders_placed])}",
                 "SUCCESS"
             )
         else:
@@ -1303,7 +1733,6 @@ class ProgrammeFetcher:
         log_and_print(f"Total: {len(added_symbols)} symbols added, {len(set(failed_symbols))} failed, {len(pending_orders_placed)} pending orders placed", "INFO")
 
         return len(added_symbols), len(pending_orders_placed)
-
 
 async def main():
     """Main function to fetch lot size/risk data, bouncestream signals, initialize MT5, add symbols to watchlist, and place orders for bouncestream accounts."""
@@ -1321,7 +1750,7 @@ async def main():
         log_and_print("Aborting due to failure in fetching bouncestream signals", "ERROR")
         print("\n")
         return
-    run_verifysignals_main()
+    run_validatesignals_main()
 
     fetcher = ProgrammeFetcher()
 
@@ -1364,6 +1793,8 @@ async def main():
     log_and_print(f"Total accounts with pending orders placed: {accounts_with_orders}", "INFO" if accounts_with_orders > 0 else "WARNING")
     log_and_print(f"Total pending orders loaded: {fetcher.total_signals_loaded}", "INFO")
     log_and_print(f"Total pending orders placed: {total_orders_placed}", "INFO" if total_orders_placed > 0 else "WARNING")
+    log_and_print(f"Total Alltimeframes orders placed: {fetcher.total_alltimeframes_orders}", "INFO" if fetcher.total_alltimeframes_orders > 0 else "WARNING")
+    log_and_print(f"Total Priority-timeframes orders placed: {fetcher.total_priority_timeframes_orders}", "INFO" if fetcher.total_priority_timeframes_orders > 0 else "WARNING")
     log_and_print(f"Total failed pending orders placed: {fetcher.total_failed_orders}", "INFO" if fetcher.total_failed_orders == 0 else "WARNING")
     log_and_print(f"Skipped records: {skipped_records}", "INFO")
 
