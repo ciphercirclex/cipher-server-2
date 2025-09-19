@@ -1,4 +1,5 @@
 import connectwithinfinitydb as db
+import verifysignals
 import MetaTrader5 as mt5
 import os
 import shutil
@@ -11,6 +12,8 @@ from datetime import datetime, timezone,  timedelta
 import pytz
 import json
 import threading
+import difflib
+
 
 # Initialize colorama for colored console output
 init()
@@ -207,7 +210,253 @@ async def executefetchlotsizeandrisk():
         return False
     log_and_print("Successfully fetched lot size and allowed risk data", "SUCCESS")
     return True
+#bouncestream signals
+async def fetch_bouncestream_signals(json_dir: str = BASE_LOTSIZE_FOLDER) -> bool:
+    """Fetch bouncestream signals, add summary with timeframe counts, and store them in bouncestreamsignals.json with lot size and allowed risk."""
+    log_and_print("===== Fetching Bouncestream Signals =====", "TITLE")
 
+    # Initialize error log list
+    error_log = []
+    
+    # Define error log file path
+    error_json_path = os.path.join(json_dir, "fetchbouncestreamsignalserror.json")
+    
+    # Helper function to save errors to JSON
+    def save_errors():
+        try:
+            with open(error_json_path, 'w', encoding='utf-8') as f:
+                json.dump(error_log, f, indent=4)
+            log_and_print(f"Errors saved to {error_json_path}", "INFO")
+        except Exception as e:
+            log_and_print(f"Failed to save errors to {error_json_path}: {str(e)}", "ERROR")
+
+    # Load lot size and risk data from JSON
+    lotsize_json_path = os.path.join(json_dir, "lotsizeandrisk.json")
+    if not os.path.exists(lotsize_json_path):
+        error_log.append({
+            "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+            "error": f"Lot size JSON file not found at {lotsize_json_path}"
+        })
+        save_errors()
+        log_and_print(f"Lot size JSON file not found at {lotsize_json_path}", "ERROR")
+        return False
+
+    try:
+        with open(lotsize_json_path, 'r', encoding='utf-8') as f:
+            lotsize_data = json.load(f)
+        log_and_print(f"Loaded lot size data from {lotsize_json_path}", "INFO")
+    except Exception as e:
+        error_log.append({
+            "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+            "error": f"Failed to load lot size JSON: {str(e)}"
+        })
+        save_errors()
+        log_and_print(f"Failed to load lot size JSON: {str(e)}", "ERROR")
+        return False
+
+    # SQL query to fetch signals
+    sql_query = """
+        SELECT id, pair, timeframe, order_type, entry_price, exit_price, ratio_0_5_price, ratio_1_price, 
+            ratio_2_price, profit_price, created_at
+        FROM cipherbouncestream_signals
+    """
+    log_and_print(f"Fetching signals with query: {sql_query}", "INFO")
+
+    # Execute query with retries
+    signals = []
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        try:
+            result = db.execute_query(sql_query)
+            log_and_print(f"Raw query result for signals: {json.dumps(result, indent=2)}", "DEBUG")
+
+            if not isinstance(result, dict):
+                error_log.append({
+                    "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                    "error": f"Invalid result format on attempt {attempt}: Expected dict, got {type(result)}"
+                })
+                save_errors()
+                log_and_print(f"Invalid result format on attempt {attempt}: Expected dict, got {type(result)}", "ERROR")
+                continue
+
+            if result.get('status') != 'success':
+                error_message = result.get('message', 'No message provided')
+                error_log.append({
+                    "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                    "error": f"Query failed on attempt {attempt}: {error_message}"
+                })
+                save_errors()
+                log_and_print(f"Query failed on attempt {attempt}: {error_message}", "ERROR")
+                continue
+
+            rows = None
+            if 'data' in result and 'rows' in result['data'] and isinstance(result['data']['rows'], list):
+                rows = result['data']['rows']
+            elif 'results' in result and isinstance(result['results'], list):
+                rows = result['results']
+            else:
+                error_log.append({
+                    "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                    "error": f"Invalid or missing rows in result on attempt {attempt}: {json.dumps(result, indent=2)}"
+                })
+                save_errors()
+                log_and_print(f"Invalid or missing rows in result on attempt {attempt}: {json.dumps(result, indent=2)}", "ERROR")
+                continue
+
+            signals = [
+                {
+                    'pair': row.get('pair', '').lower(),
+                    'timeframe': row.get('timeframe', '').lower(),
+                    'order_type': row.get('order_type', '').lower(),
+                    'entry_price': float(row.get('entry_price', 0.0)),
+                    'exit_price': float(row.get('exit_price', 0.0)),
+                    'ratio_0_5_price': float(row.get('ratio_0_5_price', 0.0)),
+                    'ratio_1_price': float(row.get('ratio_1_price', 0.0)),
+                    'ratio_2_price': float(row.get('ratio_2_price', 0.0)),
+                    'profit_price': float(row.get('profit_price', 0.0)),
+                    'created_at': row.get('created_at', 'N/A')
+                } for row in rows
+            ]
+            log_and_print(f"Fetched {len(signals)} signals from cipherbouncestream_signals", "SUCCESS")
+            break
+
+        except Exception as e:
+            error_log.append({
+                "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                "error": f"Exception on attempt {attempt}: {str(e)}"
+            })
+            save_errors()
+            log_and_print(f"Exception on attempt {attempt}: {str(e)}", "ERROR")
+            if attempt < RETRY_MAX_ATTEMPTS:
+                delay = RETRY_DELAY * (2 ** (attempt - 1))
+                log_and_print(f"Retrying after {delay} seconds...", "INFO")
+                await asyncio.sleep(delay)
+            else:
+                error_log.append({
+                    "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                    "error": "Max retries reached for fetching signals"
+                })
+                save_errors()
+                log_and_print("Max retries reached for fetching signals", "ERROR")
+                return False
+
+    if not signals:
+        error_log.append({
+            "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+            "error": "No signals found to process"
+        })
+        save_errors()
+        log_and_print("No signals found to process", "WARNING")
+        return False
+
+    # Add lot size and allowed risk to each signal
+    for signal in signals:
+        lot_size = None
+        allowed_risk = None
+        # Normalize timeframe for matching with lotsize_data
+        normalized_timeframe = signal['timeframe'].lower().replace('4hour', '4hours')
+        for item in lotsize_data:
+            item_timeframe = item['timeframe'].lower().replace('4hour', '4hours')
+            if item['pair'].lower() == signal['pair'] and item_timeframe == normalized_timeframe:
+                lot_size = float(item.get('lot_size', 0.0)) if item.get('lot_size') is not None else 0.0
+                allowed_risk = float(item.get('allowed_risk', 0.0)) if item.get('allowed_risk') is not None else 0.0
+                break
+
+        signal['lot_size'] = lot_size if lot_size is not None else 0.0
+        signal['allowed_risk'] = allowed_risk if allowed_risk is not None else 0.0
+
+    # Calculate summary statistics
+    total_pending = len(signals)
+    timeframe_counts = {
+        '5minutes': 0,
+        '15minutes': 0,
+        '30minutes': 0,
+        '1hour': 0,
+        '4hours': 0
+    }
+    for signal in signals:
+        timeframe = signal['timeframe'].lower().replace('4hour', '4hours')
+        if timeframe == '5minutes':
+            timeframe_counts['5minutes'] += 1
+        elif timeframe == '15minutes':
+            timeframe_counts['15minutes'] += 1
+        elif timeframe == '30minutes':
+            timeframe_counts['30minutes'] += 1
+        elif timeframe == '1hour':
+            timeframe_counts['1hour'] += 1
+        elif timeframe == '4hours':
+            timeframe_counts['4hours'] += 1
+
+    # Create output JSON structure with summary
+    output_data = {
+        "bouncestream_pendingorders": total_pending,
+        "5minutes pending orders": timeframe_counts['5minutes'],
+        "15minutes pending orders": timeframe_counts['15minutes'],
+        "30minutes pending orders": timeframe_counts['30minutes'],
+        "1Hour pending orders": timeframe_counts['1hour'],
+        "4Hours pending orders": timeframe_counts['4hours'],
+        "orders": signals
+    }
+
+    # Define output path for signals JSON
+    output_json_path = os.path.join(json_dir, "bouncestreamsignals.json")
+
+    # Create output directory if it doesn't exist
+    if not os.path.exists(json_dir):
+        try:
+            os.makedirs(json_dir, exist_ok=True)
+            log_and_print(f"Created output directory: {json_dir}", "INFO")
+        except Exception as e:
+            error_log.append({
+                "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                "error": f"Error creating directory {json_dir}: {str(e)}"
+            })
+            save_errors()
+            log_and_print(f"Error creating directory {json_dir}: {str(e)}", "ERROR")
+            return False
+
+    # Delete existing file if it exists to overwrite
+    if os.path.exists(output_json_path):
+        try:
+            os.remove(output_json_path)
+            log_and_print(f"Existing {output_json_path} deleted", "INFO")
+        except Exception as e:
+            error_log.append({
+                "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+                "error": f"Error deleting existing {output_json_path}: {str(e)}"
+            })
+            save_errors()
+            log_and_print(f"Error deleting existing {output_json_path}: {str(e)}", "ERROR")
+            return False
+
+    # Save signals with summary to JSON
+    try:
+        with open(output_json_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=4)
+        # Set file permissions to ensure accessibility
+        os.chmod(output_json_path, 0o666)  # Read/write for owner, group, others
+        log_and_print(f"Bouncestream signals with summary saved to {output_json_path}", "SUCCESS")
+        return True
+    except Exception as e:
+        error_log.append({
+            "timestamp": datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00'),
+            "error": f"Error saving {output_json_path}: {str(e)}"
+        })
+        save_errors()
+        log_and_print(f"Error saving {output_json_path}: {str(e)}", "ERROR")
+        return False
+async def execute_fetch_bouncestream_signals():
+    """Execute the fetch_bouncestream_signals function and handle its result."""
+    log_and_print("Starting bouncestream signals fetch", "INFO")
+    if not await fetch_bouncestream_signals():
+        log_and_print("Failed to fetch bouncestream signals. Exiting.", "ERROR")
+        return False
+    log_and_print("Successfully fetched bouncestream signals", "SUCCESS")
+    return True
+def run_verifysignals_main():
+    try:
+        verifysignals.main()
+    except Exception as e:
+        print(f"Error in analysechart_m (M15): {e}")
 
 
 # Configuration Manager Class
@@ -334,6 +583,8 @@ class ProgrammeFetcher:
         self.config = ConfigManager()
         self.mt5_manager = MT5Manager()
         self.processed_programme_ids: set[str] = set()
+        self.total_signals_loaded: int = 0  # Track total signals loaded
+        self.total_failed_orders: int = 0   # Track total failed orders
 
     def normalize_row(self, row: Dict) -> Dict:
         """Normalize row data to handle string 'None' values and ensure correct types."""
@@ -494,7 +745,6 @@ class ProgrammeFetcher:
             if not symbols:
                 error_code, error_message = thread_local.mt5.last_error()
                 log_and_print(f"Failed to retrieve symbols for {account_key}. Error: {error_code}, {error_message}", "ERROR")
-                #thread_local.mt5.shutdown() hey grok dont uncomment this, its on purpose
                 return False
 
             log_and_print(f"Retrieved {len(symbols)} symbols for {account_key}", "INFO")
@@ -508,193 +758,555 @@ class ProgrammeFetcher:
                     log_and_print(f"Added symbol {symbol.name} to Market Watch for {account_key}", "DEBUG")
 
             log_and_print(f"Successfully added all symbols to Market Watch for {account_key}", "SUCCESS")
-            #thread_local.mt5.shutdown() hey grok dont uncomment this, its on purpose
             return True
 
         except Exception as e:
             log_and_print(f"Exception while adding symbols for {account_key}: {str(e)}", "ERROR")
-            #thread_local.mt5.shutdown() hey grok dont uncomment this, its on purpose
             return False
 
-    async def process_account_initialization(self, valid_accounts: List[Dict]):
-        """Process MT5 initialization and symbol addition for valid bouncestream accounts."""
-        log_and_print("===== Processing MT5 Initialization and Symbol Addition for Bouncestream Accounts =====", "TITLE")
+    async def process_account_initialization(self, valid_accounts: List[Dict]) -> tuple[int, int, int, int]:
+        """Process MT5 initialization, symbol addition, and order placement for valid bouncestream accounts in batches."""
+        log_and_print("===== Processing MT5 Initialization, Symbol Addition, and Order Placement for Bouncestream Accounts =====", "TITLE")
 
         if not valid_accounts:
             log_and_print("No valid bouncestream accounts to process for initialization", "WARNING")
-            return 0
+            return 0, 0, 0, 0
 
         if not self.config.validate_mt5_directory():
             log_and_print("Aborting initialization due to invalid MetaTrader 5 directory", "ERROR")
-            return 0
+            return 0, 0, 0, 0
+
+        # Load signals from JSON
+        signals_json_path = os.path.join(BASE_LOTSIZE_FOLDER, "bouncestreamsignals.json")
+        try:
+            with open(signals_json_path, 'r') as file:
+                signals_data = json.load(file)
+            signals = signals_data.get('orders', [])
+            self.total_signals_loaded += len(signals)
+            log_and_print(f"Loaded {len(signals)} signals from {signals_json_path}", "INFO")
+        except Exception as e:
+            log_and_print(f"Error loading signals from {signals_json_path}: {str(e)}", "ERROR")
+            return 0, 0, 0, 0
+
+        # Group signals by symbol
+        symbol_signals = {}
+        for signal in signals:
+            symbol = signal['pair'].lower()
+            if symbol not in symbol_signals:
+                symbol_signals[symbol] = []
+            symbol_signals[symbol].append(signal)
 
         accounts_logged_in = 0
         accounts_with_symbols = 0
+        total_orders_placed = 0
+        accounts_with_orders = set()
+        batch_size = 20
 
-        # Process main accounts
-        for account in valid_accounts:
-            user_id = account['user_id']
-            subaccount_id = account['subaccount_id']
-            broker_details = {
-                'broker_server': account.get('broker_server'),
-                'broker_loginid': account.get('broker_loginid'),
-                'broker_password': account.get('broker_password')
-            }
-            account_key = f"user_{user_id}_sub_{subaccount_id}" if subaccount_id else f"user_{user_id}"
-            account_type = "sa" if subaccount_id else "ma"
+        # Process accounts in batches of 20
+        for batch_start in range(0, len(valid_accounts), batch_size):
+            batch_accounts = valid_accounts[batch_start:batch_start + batch_size]
+            log_and_print(f"Processing batch {batch_start // batch_size + 1} with {len(batch_accounts)} accounts", "INFO")
 
-            if not all([broker_details['broker_server'], broker_details['broker_loginid'], broker_details['broker_password']]):
-                log_and_print(f"Skipping initialization for {account_key}: Missing broker details", "ERROR")
-                continue
+            # For each symbol, process all accounts in the batch
+            for symbol, symbol_specific_signals in symbol_signals.items():
+                log_and_print(f"Processing orders for symbol {symbol} across batch", "INFO")
+                for account in batch_accounts:
+                    user_id = account['user_id']
+                    subaccount_id = account['subaccount_id']
+                    account_type = "sa" if subaccount_id else "ma"
+                    account_key = f"user_{user_id}_sub_{subaccount_id}" if subaccount_id else f"user_{user_id}"
 
-            terminal_path = self.config.create_account_terminal(user_id, account_type)
-            if not terminal_path:
-                log_and_print(f"Skipping initialization for {account_key}: Failed to create terminal", "ERROR")
-                continue
+                    broker_details = {
+                        'broker_server': account.get('broker_server'),
+                        'broker_loginid': account.get('broker_loginid'),
+                        'broker_password': account.get('broker_password')
+                    }
 
-            if self.mt5_manager.initialize_mt5(
-                server=broker_details['broker_server'],
-                login=broker_details['broker_loginid'],
-                password=broker_details['broker_password'],
-                terminal_path=terminal_path
-            ):
-                accounts_logged_in += 1
-                log_and_print(f"MT5 initialization successful for {account_key}", "SUCCESS")
-                
-                # Add symbols to Market Watch
-                if await self.add_symbols_to_watchlist(account, terminal_path):
-                    accounts_with_symbols += 1
-                    log_and_print(f"Successfully added symbols to Market Watch for {account_key}", "SUCCESS")
-                else:
-                    log_and_print(f"Failed to add symbols to Market Watch for {account_key}", "ERROR")
+                    if not all([broker_details['broker_server'], broker_details['broker_loginid'], broker_details['broker_password']]):
+                        error_message = "Missing broker details (server, login, or password)"
+                        log_and_print(f"Skipping initialization for {account_key}: {error_message}", "ERROR")
+                        self.save_account_order_error(account_key, "N/A", error_message)
+                        continue
 
-                #thread_local.mt5.shutdown() hey grok dont uncomment this, its on purpose
-                log_and_print(f"MT5 connection closed for {account_key}", "INFO")
+                    terminal_path = self.config.create_account_terminal(user_id, account_type)
+                    if not terminal_path:
+                        error_message = "Failed to create MetaTrader 5 terminal directory"
+                        log_and_print(f"Skipping initialization for {account_key}: {error_message}", "ERROR")
+                        self.save_account_order_error(account_key, "N/A", error_message)
+                        continue
+
+                    # Initialize MT5 and get available symbols
+                    for attempt in range(1, MAX_RETRIES + 1):
+                        try:
+                            if self.mt5_manager.initialize_mt5(
+                                server=account['broker_server'],
+                                login=account['broker_loginid'],
+                                password=account['broker_password'],
+                                terminal_path=terminal_path
+                            ):
+                                log_and_print(f"MT5 initialization successful for {account_key} for symbol {symbol}", "SUCCESS")
+                                accounts_logged_in += 1
+                                break
+                            else:
+                                error_message = f"MT5 initialization failed: {thread_local.mt5.last_error()}"
+                                log_and_print(f"MT5 initialization failed for {account_key} on attempt {attempt}: {error_message}", "ERROR")
+                                if attempt == MAX_RETRIES:
+                                    self.save_account_order_error(account_key, "N/A", error_message)
+                                    continue
+                                log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
+                                await asyncio.sleep(MT5_RETRY_DELAY)
+                        except Exception as e:
+                            error_message = f"Exception during MT5 initialization: {str(e)}"
+                            log_and_print(f"Exception during MT5 initialization for {account_key} on attempt {attempt}: {error_message}", "ERROR")
+                            if attempt == MAX_RETRIES:
+                                self.save_account_order_error(account_key, "N/A", error_message)
+                                continue
+                            log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
+                            await asyncio.sleep(MT5_RETRY_DELAY)
+
+                    available_symbols = self.get_available_symbols()
+                    if not available_symbols:
+                        error_message = "No available symbols retrieved from server"
+                        log_and_print(f"No available symbols for {account_key}, aborting order placement: {error_message}", "ERROR")
+                        self.save_account_order_error(account_key, "N/A", error_message)
+                        continue
+
+                    # Place orders for this symbol
+                    symbols_added, orders_placed = await self.place_orders_for_account(account, terminal_path, symbol_specific_signals, available_symbols)
+                    if symbols_added > 0:
+                        accounts_with_symbols += 1
+                    if orders_placed > 0:
+                        accounts_with_orders.add(account_key)
+                    total_orders_placed += orders_placed
+
+        return accounts_logged_in, accounts_with_symbols, total_orders_placed, len(accounts_with_orders)
+
+    def get_available_symbols(self) -> List[str]:
+        """Fetch and return all available symbols on the server."""
+        try:
+            symbols = thread_local.mt5.symbols_get()
+            if symbols:
+                symbol_names = [s.name for s in symbols]
+                log_and_print(f"Available symbols on server ({len(symbol_names)}): {', '.join(symbol_names)}", "DEBUG")
+                return symbol_names
             else:
-                log_and_print(f"Failed to initialize MT5 for {account_key}", "ERROR")
-
-        return accounts_logged_in, accounts_with_symbols   
-
-    async def fetch_bouncestream_signals(self, valid_accounts: List[Dict]) -> int:
-        """Fetch bouncestream signals and store them in bouncestreamsignals.json with lot size, allowed risk, and order type."""
-        log_and_print("===== Fetching Bouncestream Signals =====", "TITLE")
-
-        # Load lot size and risk data from JSON
-        lotsize_json_path = os.path.join(BASE_LOTSIZE_FOLDER, "lotsizeandrisk.json")
-        if not os.path.exists(lotsize_json_path):
-            log_and_print(f"Lot size JSON file not found at {lotsize_json_path}", "ERROR")
-            return 0
-
-        try:
-            with open(lotsize_json_path, 'r') as f:
-                lotsize_data = json.load(f)
-            log_and_print(f"Loaded lot size data from {lotsize_json_path}", "INFO")
+                log_and_print("No symbols retrieved from server", "ERROR")
+                return []
         except Exception as e:
-            log_and_print(f"Failed to load lot size JSON: {str(e)}", "ERROR")
-            return 0
+            log_and_print(f"Error fetching available symbols: {str(e)}", "ERROR")
+            return []
 
-        # SQL query to fetch signals
-        sql_query = """
-            SELECT id, pair, timeframe, order_type, entry_price, ratio_0_5_price, ratio_1_price, 
-                ratio_2_price, profit_price, created_at
-            FROM cipherbouncestream_signals
-        """
-        log_and_print(f"Fetching signals with query: {sql_query}", "INFO")
+    def get_exact_symbol_match(self, json_symbol: str, available_symbols: List[str]) -> Optional[str]:
+        """Find the exact server symbol matching the JSON symbol (case-insensitive)."""
+        json_lower = json_symbol.lower()
+        lower_available = [s.lower() for s in available_symbols]
+        if json_lower in lower_available:
+            index = lower_available.index(json_lower)
+            exact = available_symbols[index]
+            log_and_print(f"Matched '{json_symbol}' to exact server symbol: '{exact}'", "DEBUG")
+            return exact
+        else:
+            close_matches = difflib.get_close_matches(json_symbol, available_symbols, n=3, cutoff=0.6)
+            log_and_print(f"No exact match for '{json_symbol}'. Closest server symbols: {', '.join(close_matches) if close_matches else 'None'}", "WARNING")
+            return None
 
-        # Execute query with retries
-        signals = []
-        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+    def save_failed_orders(self, symbol: str, order_type: str, entry_price: float, profit_price: float, stop_loss: float, 
+                        lot_size: float, allowed_risk: float, error_message: str, error_category: str = "unknown") -> None:
+        """Save a single failed pending order to a categorized JSON file incrementally."""
+        base_path = os.path.join(BASE_LOTSIZE_FOLDER, "errors")
+        output_paths = {
+            "invalid_entry": os.path.join(base_path, "failedordersinvalidentry.json"),
+            "stop_loss": os.path.join(base_path, "failedordersbystoploss.json"),
+            "unknown": os.path.join(base_path, "failedpendingorders.json")
+        }
+        output_path = output_paths.get(error_category, output_paths["unknown"])
+
+        failed_order = {
+            "symbol": symbol,
+            "order_type": order_type,
+            "entry_price": entry_price,
+            "profit_price": profit_price,
+            "stop_loss": stop_loss,
+            "lot_size": lot_size,
+            "allowed_risk": allowed_risk,
+            "error_message": error_message,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        try:
+            os.makedirs(base_path, exist_ok=True)
+            existing_data = []
+            if os.path.exists(output_path):
+                try:
+                    with open(output_path, 'r') as file:
+                        existing_data = json.load(file)
+                    if not isinstance(existing_data, list):
+                        existing_data = []
+                except json.JSONDecodeError:
+                    log_and_print(f"Corrupted JSON file at {output_path}, starting fresh", "WARNING")
+                    existing_data = []
+
+            existing_data.append(failed_order)
+            with open(output_path, 'w') as file:
+                json.dump(existing_data, file, indent=4)
+            log_and_print(f"Successfully saved failed order for {symbol} to {output_path} (Category: {error_category})", "SUCCESS")
+        except Exception as e:
+            log_and_print(f"Error saving failed order for {symbol} to {output_path}: {str(e)}", "ERROR")
+
+    def place_pending_order(self, symbol: str, order_type: str, entry_price: float, profit_price: float, stop_loss: float, 
+                        lot_size: float, allowed_risk: float) -> tuple[bool, Optional[int], Optional[str], Optional[str]]:
+        """Place a pending order with validation."""
+        try:
+            if not thread_local.mt5.symbol_select(symbol, True):
+                error_message = f"Failed to select {symbol} for pending order, error: {thread_local.mt5.last_error()}"
+                log_and_print(error_message, "ERROR")
+                return False, None, error_message, "unknown"
+
+            symbol_info = thread_local.mt5.symbol_info(symbol)
+            if symbol_info is None:
+                error_message = f"Cannot retrieve info for {symbol}"
+                log_and_print(error_message, "ERROR")
+                return False, None, error_message, "unknown"
+
+            if not symbol_info.trade_mode == thread_local.mt5.SYMBOL_TRADE_MODE_FULL:
+                error_message = f"Symbol {symbol} is not tradeable (trade mode: {symbol_info.trade_mode})"
+                log_and_print(error_message, "ERROR")
+                return False, None, error_message, "unknown"
+
+            tick = thread_local.mt5.symbol_info_tick(symbol)
+            if tick is None:
+                error_message = f"Cannot retrieve tick data for {symbol}, error: {thread_local.mt5.last_error()}"
+                log_and_print(error_message, "ERROR")
+                return False, None, error_message, "unknown"
+
+            tick_size = symbol_info.trade_tick_size
+            point = symbol_info.point
+            stops_level = symbol_info.trade_stops_level * point
+            current_bid = tick.bid
+            current_ask = tick.ask
+
+            entry_price = round(float(entry_price) / tick_size) * tick_size
+            profit_price = round(float(profit_price) / tick_size) * tick_size if profit_price else 0.0
+            stop_loss = round(float(stop_loss) / tick_size) * tick_size if stop_loss else 0.0
+
+            log_and_print(
+                f"Validating order for {symbol}: "
+                f"Order Type={order_type}, Entry={entry_price}, TP={profit_price}, SL={stop_loss}, "
+                f"Current Bid={current_bid}, Ask={current_ask}, Stops Level={stops_level}, Tick Size={tick_size}, "
+                f"Allowed Risk={allowed_risk}",
+                "DEBUG"
+            )
+
+            is_buy_limit = order_type.lower() == "buy_limit"
+            is_sell_limit = order_type.lower() == "sell_limit"
+
+            if is_buy_limit:
+                min_price = current_ask - stops_level
+                if entry_price > min_price:
+                    error_message = (
+                        f"Invalid buy_limit entry price for {symbol}. "
+                        f"Entry: {entry_price}, must be <= {min_price} (ask: {current_ask}, stops_level: {stops_level})"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "invalid_entry"
+            elif is_sell_limit:
+                max_price = current_bid + stops_level
+                if entry_price < max_price:
+                    error_message = (
+                        f"Invalid sell_limit entry price for {symbol}. "
+                        f"Entry: {entry_price}, must be >= {max_price} (bid: {current_bid}, stops_level: {stops_level})"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "invalid_entry"
+            else:
+                error_message = f"Unsupported order type {order_type} for {symbol}"
+                log_and_print(error_message, "ERROR")
+                return False, None, error_message, "unknown"
+
+            if is_buy_limit:
+                if stop_loss and stop_loss > entry_price:
+                    error_message = f"Invalid stop-loss for {symbol} (buy_limit). SL: {stop_loss}, must be <= {entry_price}"
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+                if profit_price and profit_price < entry_price:
+                    error_message = f"Invalid take-profit for {symbol} (buy_limit). TP: {profit_price}, must be >= {entry_price}"
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+                if stop_loss and abs(entry_price - stop_loss) < stops_level:
+                    error_message = (
+                        f"Stop-loss too close to entry price for {symbol}. "
+                        f"SL: {stop_loss}, Entry: {entry_price}, Distance: {abs(entry_price - stop_loss)}, "
+                        f"Required: >= {stops_level}"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+                if profit_price and abs(profit_price - entry_price) < stops_level:
+                    error_message = (
+                        f"Take-profit too close to entry price for {symbol}. "
+                        f"TP: {profit_price}, Entry: {entry_price}, Distance: {abs(profit_price - entry_price)}, "
+                        f"Required: >= {stops_level}"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+            elif is_sell_limit:
+                if stop_loss and stop_loss < entry_price:
+                    error_message = f"Invalid stop-loss for {symbol} (sell_limit). SL: {stop_loss}, must be >= {entry_price}"
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+                if profit_price and profit_price > entry_price:
+                    error_message = f"Invalid take-profit for {symbol} (sell_limit). TP: {profit_price}, must be <= {entry_price}"
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+                if stop_loss and abs(entry_price - stop_loss) < stops_level:
+                    error_message = (
+                        f"Stop-loss too close to entry price for {symbol}. "
+                        f"SL: {stop_loss}, Entry: {entry_price}, Distance: {abs(entry_price - stop_loss)}, "
+                        f"Required: >= {stops_level}"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+                if profit_price and abs(profit_price - entry_price) < stops_level:
+                    error_message = (
+                        f"Take-profit too close to entry price for {symbol}. "
+                        f"TP: {profit_price}, Entry: {entry_price}, Distance: {abs(profit_price - entry_price)}, "
+                        f"Required: >= {stops_level}"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "stop_loss"
+
+            mt5_order_type = thread_local.mt5.ORDER_TYPE_BUY_LIMIT if is_buy_limit else thread_local.mt5.ORDER_TYPE_SELL_LIMIT
+            request = {
+                "action": thread_local.mt5.TRADE_ACTION_PENDING,
+                "symbol": symbol,
+                "volume": float(lot_size),
+                "type": mt5_order_type,
+                "price": entry_price,
+                "sl": stop_loss if stop_loss else 0.0,
+                "tp": profit_price if profit_price else 0.0,
+                "type_time": thread_local.mt5.ORDER_TIME_GTC,
+                "type_filling": thread_local.mt5.ORDER_FILLING_IOC,
+            }
+
+            log_and_print(f"Sending order for {symbol}: {request}, Allowed Risk={allowed_risk}", "DEBUG")
+
+            result = thread_local.mt5.order_send(request)
+            if result.retcode != thread_local.mt5.TRADE_RETCODE_DONE:
+                error_code, error_message = thread_local.mt5.last_error()
+                full_error = f"Pending order for {symbol} failed, error: {result.retcode}, {error_message}"
+                log_and_print(full_error, "ERROR")
+                error_category = "invalid_entry" if result.retcode == 10015 else "stop_loss" if result.retcode == 10016 else "unknown"
+                return False, None, full_error, error_category
+
+            log_and_print(
+                f"Pending {order_type} order for {symbol} placed successfully at {entry_price} "
+                f"with TP {profit_price}, SL {stop_loss}, Allowed Risk={allowed_risk} (Order #{result.order})",
+                "SUCCESS"
+            )
+            return True, result.order, None, None
+
+        except Exception as e:
+            error_message = f"Error placing pending order for {symbol}: {str(e)}"
+            log_and_print(error_message, "ERROR")
+            return False, None, error_message, "unknown"
+
+    def save_account_order_error(self, account_key: str, market: str, error_message: str) -> None:
+        """Save account-specific order placement errors to accountsordersissues.json."""
+        error_dir = os.path.join(BASE_LOTSIZE_FOLDER, "errors")
+        output_path = os.path.join(error_dir, "accountsordersissues.json")
+        
+        error_entry = {
+            "account_key": account_key,
+            "market": market if market else "N/A",
+            "pending_order_status": f"fails({error_message})"
+        }
+        
+        try:
+            os.makedirs(error_dir, exist_ok=True)
+            existing_data = []
+            if os.path.exists(output_path):
+                try:
+                    with open(output_path, 'r', encoding='utf-8') as file:
+                        existing_data = json.load(file)
+                    if not isinstance(existing_data, list):
+                        existing_data = []
+                except json.JSONDecodeError:
+                    log_and_print(f"Corrupted JSON file at {output_path}, starting fresh", "WARNING")
+                    existing_data = []
+            
+            existing_data.append(error_entry)
+            with open(output_path, 'w', encoding='utf-8') as file:
+                json.dump(existing_data, file, indent=4)
+            log_and_print(f"Saved error for {account_key} (market: {market}) to {output_path}", "INFO")
+        except Exception as e:
+            log_and_print(f"Error saving to {output_path}: {str(e)}", "ERROR")
+
+    async def place_orders_for_account(self, account: Dict, terminal_path: str, signals: List[Dict], available_symbols: List[str]) -> tuple[int, int]:
+        """Place pending orders for a valid account based on provided signals."""
+        account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
+        log_and_print(f"===== Placing Pending Orders for {account_key} =====", "TITLE")
+
+        # Initialize MT5 for the account
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
-                result = db.execute_query(sql_query)
-                log_and_print(f"Raw query result for signals: {json.dumps(result, indent=2)}", "DEBUG")
-
-                if not isinstance(result, dict):
-                    log_and_print(f"Invalid result format on attempt {attempt}: Expected dict, got {type(result)}", "ERROR")
-                    continue
-
-                if result.get('status') != 'success':
-                    error_message = result.get('message', 'No message provided')
-                    log_and_print(f"Query failed on attempt {attempt}: {error_message}", "ERROR")
-                    continue
-
-                rows = None
-                if 'data' in result and 'rows' in result['data'] and isinstance(result['data']['rows'], list):
-                    rows = result['data']['rows']
-                elif 'results' in result and isinstance(result['results'], list):
-                    rows = result['results']
-                else:
-                    log_and_print(f"Invalid or missing rows in result on attempt {attempt}: {json.dumps(result, indent=2)}", "ERROR")
-                    continue
-
-                signals = [
-                    {
-                        'pair': row.get('pair', '').lower(),
-                        'timeframe': row.get('timeframe', '').lower(),
-                        'order_type': row.get('order_type', '').lower(),
-                        'entry_price': float(row.get('entry_price', 0.0)),
-                        'exit_price': '',  # No exit price in schema, setting as empty string
-                        'ratio_0_5_price': float(row.get('ratio_0_5_price', 0.0)),
-                        'ratio_1_price': float(row.get('ratio_1_price', 0.0)),
-                        'ratio_2_price': float(row.get('ratio_2_price', 0.0)),
-                        'profit_price': float(row.get('profit_price', 0.0)),
-                        'created_at': row.get('created_at', 'N/A')
-                    } for row in rows
-                ]
-                log_and_print(f"Fetched {len(signals)} signals from cipherbouncestream_signals", "SUCCESS")
-                break
-
-            except Exception as e:
-                log_and_print(f"Exception on attempt {attempt}: {str(e)}", "ERROR")
-                if attempt < RETRY_MAX_ATTEMPTS:
-                    delay = RETRY_DELAY * (2 ** (attempt - 1))
-                    log_and_print(f"Retrying after {delay} seconds...", "INFO")
-                    await asyncio.sleep(delay)
-                else:
-                    log_and_print("Max retries reached for fetching signals", "ERROR")
-                    return 0
-
-        if not signals:
-            log_and_print("No signals found to process", "WARNING")
-            return 0
-
-        # Add lot size and allowed risk to each signal
-        for signal in signals:
-            lot_size = None
-            allowed_risk = None
-            for item in lotsize_data:
-                if item['pair'].lower() == signal['pair'] and item['timeframe'].lower() == signal['timeframe']:
-                    lot_size = float(item.get('lot_size', 0.0)) if item.get('lot_size') is not None else 0.0
-                    allowed_risk = float(item.get('allowed_risk', 0.0)) if item.get('allowed_risk') is not None else 0.0
+                if self.mt5_manager.initialize_mt5(
+                    server=account['broker_server'],
+                    login=account['broker_loginid'],
+                    password=account['broker_password'],
+                    terminal_path=terminal_path
+                ):
+                    log_and_print(f"MT5 initialization successful for {account_key} on attempt {attempt}", "SUCCESS")
                     break
-
-            signal['lot_size'] = lot_size if lot_size is not None else 0.0
-            signal['allowed_risk'] = allowed_risk if allowed_risk is not None else 0.0
-
-        # Define output path for signals JSON
-        output_json_path = os.path.join(BASE_LOTSIZE_FOLDER, "bouncestreamsignals.json")
-
-        # Delete existing file if it exists to overwrite
-        if os.path.exists(output_json_path):
-            try:
-                os.remove(output_json_path)
-                log_and_print(f"Existing {output_json_path} deleted", "INFO")
+                else:
+                    error_message = f"MT5 initialization failed: {thread_local.mt5.last_error()}"
+                    log_and_print(f"MT5 initialization failed for {account_key} on attempt {attempt}: {error_message}", "ERROR")
+                    if attempt == MAX_RETRIES:
+                        self.save_account_order_error(account_key, "N/A", error_message)
+                        return 0, 0
+                    log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
+                    await asyncio.sleep(MT5_RETRY_DELAY)
             except Exception as e:
-                log_and_print(f"Error deleting existing {output_json_path}: {str(e)}", "ERROR")
-                return 0
+                error_message = f"Exception during MT5 initialization: {str(e)}"
+                log_and_print(f"Exception during MT5 initialization for {account_key} on attempt {attempt}: {error_message}", "ERROR")
+                if attempt == MAX_RETRIES:
+                    self.save_account_order_error(account_key, "N/A", error_message)
+                    return 0, 0
+                log_and_print(f"Retrying MT5 initialization after {MT5_RETRY_DELAY} seconds...", "INFO")
+                await asyncio.sleep(MT5_RETRY_DELAY)
 
-        # Save signals to JSON
-        try:
-            with open(output_json_path, 'w') as f:
-                json.dump(signals, f, indent=4)
-            log_and_print(f"Bouncestream signals saved to {output_json_path}", "SUCCESS")
-            return len(signals)
-        except Exception as e:
-            log_and_print(f"Error saving {output_json_path}: {str(e)}", "ERROR")
-            return 0
+        added_symbols = []
+        failed_symbols = []
+        pending_orders_placed = []
 
-# Main Execution Function
+        # Step 1: Add symbols to Market Watch
+        unique_symbols = list(set(signal['pair'] for signal in signals))
+        for json_symbol in unique_symbols:
+            try:
+                server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
+                if server_symbol is None:
+                    error_message = "No server symbol match found"
+                    log_and_print(f"Skipping {json_symbol} for {account_key}: {error_message}", "ERROR")
+                    failed_symbols.append(json_symbol)
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
+                    continue
+
+                for attempt in range(1, MAX_RETRIES + 1):
+                    if thread_local.mt5.symbol_select(server_symbol, True):
+                        log_and_print(f"Symbol {server_symbol} selected directly in Market Watch for {account_key}", "SUCCESS")
+                        added_symbols.append(server_symbol)
+                        break
+                    else:
+                        log_and_print(f"Direct selection of {server_symbol} failed for {account_key}, attempting test order on attempt {attempt}", "WARNING")
+                        if self.place_test_order(server_symbol):
+                            log_and_print(f"Symbol {server_symbol} added to Market Watch via test order for {account_key}", "SUCCESS")
+                            added_symbols.append(server_symbol)
+                            break
+                        else:
+                            log_and_print(f"Attempt {attempt}/{MAX_RETRIES}: Test order for {server_symbol} failed for {account_key}", "WARNING")
+                            if attempt == MAX_RETRIES:
+                                error_message = f"Failed to add {server_symbol} to Market Watch after retries: {thread_local.mt5.last_error()}"
+                                log_and_print(error_message, "ERROR")
+                                failed_symbols.append(json_symbol)
+                                self.save_account_order_error(account_key, json_symbol, error_message)
+                                self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
+                                continue
+                            log_and_print(f"Retrying test order after {MT5_RETRY_DELAY} seconds...", "INFO")
+                            await asyncio.sleep(MT5_RETRY_DELAY)
+
+            except Exception as e:
+                error_message = f"Error processing symbol {json_symbol}: {str(e)}"
+                log_and_print(error_message, "ERROR")
+                failed_symbols.append(json_symbol)
+                self.save_account_order_error(account_key, json_symbol, error_message)
+                self.total_failed_orders += sum(1 for signal in signals if signal['pair'] == json_symbol)
+
+        # Step 2: Place pending orders (signals processed externally in batches)
+        for signal in signals:
+            try:
+                json_symbol = signal['pair']
+                order_type = signal['order_type']
+                entry_price = signal['entry_price']
+                profit_price = signal['profit_price'] if signal['profit_price'] else None
+                stop_loss = signal['exit_price'] if signal['exit_price'] else None
+                lot_size = signal['lot_size']
+                allowed_risk = signal['allowed_risk'] if signal.get('allowed_risk') is not None else None
+
+                # Pre-validate signal data
+                if not all([json_symbol, order_type, entry_price, lot_size]):
+                    error_message = "Invalid signal data: Missing required fields"
+                    log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += 1
+                    continue
+                if order_type not in ['buy_limit', 'sell_limit']:
+                    error_message = f"Unsupported order type {order_type}"
+                    log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += 1
+                    continue
+                if lot_size <= 0.0:
+                    error_message = f"Invalid lot size {lot_size}"
+                    log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += 1
+                    continue
+
+                server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
+                if server_symbol is None:
+                    error_message = "No server symbol match found"
+                    log_and_print(f"Skipping pending order for {json_symbol} for {account_key}: {error_message}", "WARNING")
+                    failed_symbols.append(json_symbol)
+                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.total_failed_orders += 1
+                    continue
+
+                if server_symbol in added_symbols:
+                    success, order_id, error_message, error_category = self.place_pending_order(
+                        server_symbol, order_type, entry_price, profit_price, stop_loss, lot_size, allowed_risk
+                    )
+                    if success:
+                        pending_orders_placed.append((server_symbol, order_id, order_type, entry_price, profit_price, stop_loss, allowed_risk))
+                    else:
+                        log_and_print(f"Failed to place pending order for {server_symbol} for {account_key}: {error_message}", "ERROR")
+                        failed_symbols.append(json_symbol)
+                        self.save_account_order_error(account_key, server_symbol, error_message)
+                        self.total_failed_orders += 1
+                        self.save_failed_orders(
+                            server_symbol, order_type, entry_price, profit_price, stop_loss, 
+                            lot_size, allowed_risk, error_message, error_category
+                        )
+                else:
+                    error_message = f"Symbol {server_symbol} not added to Market Watch"
+                    log_and_print(f"Skipping pending order for {server_symbol} for {account_key}: {error_message}", "WARNING")
+                    self.save_account_order_error(account_key, server_symbol, error_message)
+                    self.total_failed_orders += 1
+
+            except Exception as e:
+                error_message = f"Error processing signal for {json_symbol}: {str(e)}"
+                log_and_print(error_message, "ERROR")
+                failed_symbols.append(json_symbol)
+                self.save_account_order_error(account_key, json_symbol, error_message)
+                self.total_failed_orders += 1
+
+        # Log summary
+        log_and_print(f"===== Order Placement Summary for {account_key} =====", "TITLE")
+        if added_symbols:
+            log_and_print(f"Symbols added to Market Watch: {', '.join(added_symbols)}", "SUCCESS")
+        if failed_symbols:
+            log_and_print(f"Symbols failed to add or process: {', '.join(set(failed_symbols))}", "ERROR")
+        if pending_orders_placed:
+            log_and_print(
+                f"Pending orders placed: {', '.join([f'{sym} ({otype} at {entry}, TP {tp}, SL {sl}, Risk {risk})' for sym, oid, otype, entry, tp, sl, risk in pending_orders_placed])}",
+                "SUCCESS"
+            )
+        else:
+            log_and_print("No pending orders placed", "INFO")
+        log_and_print(f"Total: {len(added_symbols)} symbols added, {len(set(failed_symbols))} failed, {len(pending_orders_placed)} pending orders placed", "INFO")
+
+        return len(added_symbols), len(pending_orders_placed)
+
+
 async def main():
-    """Main function to fetch lot size/risk data, initialize MT5, add symbols to watchlist, and fetch signals for bouncestream accounts."""
+    """Main function to fetch lot size/risk data, bouncestream signals, initialize MT5, add symbols to watchlist, and place orders for bouncestream accounts."""
     print("\n")
     log_and_print("===== Server Bouncestream Processing Started =====", "TITLE")
     
@@ -703,6 +1315,13 @@ async def main():
         log_and_print("Aborting due to failure in fetching lot size and risk data", "ERROR")
         print("\n")
         return
+
+    # Fetch bouncestream signals
+    if not await execute_fetch_bouncestream_signals():
+        log_and_print("Aborting due to failure in fetching bouncestream signals", "ERROR")
+        print("\n")
+        return
+    run_verifysignals_main()
 
     fetcher = ProgrammeFetcher()
 
@@ -734,10 +1353,7 @@ async def main():
             skipped_records += 1
     log_and_print(f"Validated {len(valid_accounts)} out of {total_programmes} programme records", "SUCCESS")
 
-    accounts_initialized, accounts_with_symbols = await fetcher.process_account_initialization(valid_accounts)
-
-    # Fetch bouncestream signals
-    signals_fetched = await fetcher.fetch_bouncestream_signals(valid_accounts)
+    accounts_initialized, accounts_with_symbols, total_orders_placed, accounts_with_orders = await fetcher.process_account_initialization(valid_accounts)
 
     print("\n")
     log_and_print("===== Processing Summary =====", "TITLE")
@@ -745,11 +1361,15 @@ async def main():
     log_and_print(f"Total bouncestream accounts passed verification: {len(valid_accounts)}", "INFO")
     log_and_print(f"Total accounts MT5 initialized: {accounts_initialized}", "INFO" if accounts_initialized > 0 else "WARNING")
     log_and_print(f"Total accounts with symbols added to Market Watch: {accounts_with_symbols}", "INFO" if accounts_with_symbols > 0 else "WARNING")
-    log_and_print(f"Total signals fetched and saved: {signals_fetched}", "INFO" if signals_fetched > 0 else "WARNING")
+    log_and_print(f"Total accounts with pending orders placed: {accounts_with_orders}", "INFO" if accounts_with_orders > 0 else "WARNING")
+    log_and_print(f"Total pending orders loaded: {fetcher.total_signals_loaded}", "INFO")
+    log_and_print(f"Total pending orders placed: {total_orders_placed}", "INFO" if total_orders_placed > 0 else "WARNING")
+    log_and_print(f"Total failed pending orders placed: {fetcher.total_failed_orders}", "INFO" if fetcher.total_failed_orders == 0 else "WARNING")
     log_and_print(f"Skipped records: {skipped_records}", "INFO")
 
     print("\n")
-    log_and_print("===== Server Bouncestream Processing Completed =====", "TITLE")
+    log_and_print("===== Server Bouncestream Processing completed =====")
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
