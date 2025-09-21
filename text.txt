@@ -11,8 +11,6 @@ import pytz
 from typing import List, Dict, Optional
 from colorama import Fore, Style, init
 import threading
-import difflib
-from collections import defaultdict
 
 # Initialize colorama for colored console output
 init()
@@ -144,18 +142,23 @@ class ConfigManager:
             return None
         return value
 
-# MT5 Manager Class (Full Updated Version)
+# MT5 Manager Class
 class MT5Manager:
     """Manages MT5 initialization and login, maintaining connections without shutdown."""
     def __init__(self):
-        pass  # No need for mt5_instances dict
+        self.mt5_instances = {}  # Dictionary to store MT5 instances per account_key
 
     def initialize_mt5(self, server: str, login: str, password: str, terminal_path: str, account_key: str) -> bool:
         """Initialize MT5 terminal and login with provided credentials using the specified terminal path."""
         log_and_print(f"Attempting MT5 login for {account_key} (server: {server}, login: {login}) using {terminal_path}", "INFO")
         
+        if account_key not in self.mt5_instances:
+            self.mt5_instances[account_key] = mt5
+
+        mt5_instance = self.mt5_instances[account_key]
+
         try:
-            if mt5.initialize(  # Use global mt5 directly
+            if mt5_instance.initialize(
                 path=terminal_path,
                 login=int(login),
                 password=password,
@@ -165,7 +168,7 @@ class MT5Manager:
             ):
                 log_and_print(f"Successfully initialized MT5 terminal for {account_key}", "SUCCESS")
             else:
-                error_code, error_message = mt5.last_error()
+                error_code, error_message = mt5_instance.last_error()
                 log_and_print(f"Failed to initialize MT5 terminal for {account_key}. Error: {error_code}, {error_message}", "ERROR")
                 return False
         except Exception as e:
@@ -173,7 +176,7 @@ class MT5Manager:
             return False
 
         for _ in range(5):
-            if mt5.terminal_info() is not None:  # Use global mt5
+            if mt5_instance.terminal_info() is not None:
                 log_and_print(f"MT5 terminal fully initialized for {account_key}", "DEBUG")
                 return True
             log_and_print(f"Waiting for MT5 terminal to fully initialize for {account_key}...", "INFO")
@@ -192,104 +195,6 @@ class TradeRegulator:
         self.total_orders_adjusted = 0
         self.total_orders_failed = 0
         self.signals = []
-
-    def get_available_symbols(self, mt5_instance) -> List[str]:
-        """Retrieve all available symbols from the MT5 server."""
-        try:
-            symbols = mt5_instance.symbols_get()
-            if not symbols:
-                log_and_print("No symbols retrieved from MT5 server", "ERROR")
-                return []
-            return [symbol.name for symbol in symbols]
-        except Exception as e:
-            log_and_print(f"Error retrieving symbols from MT5 server: {str(e)}", "ERROR")
-            return []
-
-    def get_exact_symbol_match(self, json_symbol: str, available_symbols: List[str]) -> Optional[str]:
-        """Find an exact case-insensitive match for the JSON symbol in available MT5 symbols."""
-        try:
-            json_lower = json_symbol.lower()
-            lower_available = [s.lower() for s in available_symbols]
-            if json_lower in lower_available:
-                index = lower_available.index(json_lower)
-                exact = available_symbols[index]
-                #log_and_print(f"Matched '{json_symbol}' to exact server symbol: '{exact}'", "DEBUG")
-                return exact
-            else:
-                close_matches = difflib.get_close_matches(json_lower, lower_available, n=3, cutoff=0.6)
-                log_and_print(f"No exact match for '{json_symbol}'. Closest server symbols: {', '.join(close_matches) if close_matches else 'None'}", "WARNING")
-                return None
-        except Exception as e:
-            log_and_print(f"Error in get_exact_symbol_match for '{json_symbol}': {str(e)}", "ERROR")
-            return None
-
-    def place_test_order(self, mt5_instance, symbol: str) -> bool:
-        """Place a test order to add a symbol to the Market Watch."""
-        try:
-            symbol_info = mt5_instance.symbol_info(symbol)
-            if not symbol_info:
-                log_and_print(f"Cannot retrieve symbol info for test order: {symbol}", "ERROR")
-                return False
-
-            point = symbol_info.point
-            price = mt5_instance.symbol_info_tick(symbol).ask
-            request = {
-                "action": mt5_instance.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": 0.01,  # Minimum volume for test order
-                "type": mt5_instance.ORDER_TYPE_BUY,
-                "price": price,
-                "sl": price - 100 * point,
-                "tp": price + 100 * point,
-                "type_time": mt5_instance.ORDER_TIME_DAY,
-                "type_filling": mt5_instance.ORDER_FILLING_IOC,
-            }
-            result = mt5_instance.order_send(request)
-            if result.retcode == mt5_instance.TRADE_RETCODE_DONE:
-                log_and_print(f"Test order placed successfully for {symbol}, closing position", "DEBUG")
-                position_id = result.deal
-                close_request = {
-                    "action": mt5_instance.TRADE_ACTION_DEAL,
-                    "symbol": symbol,
-                    "volume": 0.01,
-                    "type": mt5_instance.ORDER_TYPE_SELL,
-                    "position": position_id,
-                    "price": mt5_instance.symbol_info_tick(symbol).bid,
-                    "type_time": mt5_instance.ORDER_TIME_DAY,
-                    "type_filling": mt5_instance.ORDER_FILLING_IOC,
-                }
-                close_result = mt5_instance.order_send(close_request)
-                if close_result.retcode == mt5_instance.TRADE_RETCODE_DONE:
-                    log_and_print(f"Test order closed successfully for {symbol}", "DEBUG")
-                    return True
-                else:
-                    log_and_print(f"Failed to close test order for {symbol}: {close_result.comment}", "ERROR")
-                    return False
-            else:
-                log_and_print(f"Failed to place test order for {symbol}: {result.comment}", "ERROR")
-                return False
-        except Exception as e:
-            log_and_print(f"Error placing test order for {symbol}: {str(e)}", "ERROR")
-            return False
-
-    def select_symbol(self, mt5_instance, symbol: str) -> bool:
-        """Ensure a symbol is selected in the Market Watch, retrying or placing a test order if needed."""
-        for attempt in range(1, MAX_RETRIES + 1):
-            if mt5_instance.symbol_select(symbol, True):
-                return True
-            else:
-                log_and_print(f"Failed to select {symbol} in Market Watch on attempt {attempt}", "WARNING")
-                if attempt == MAX_RETRIES:
-                    log_and_print(f"Attempting to add {symbol} via test order", "INFO")
-                    if self.place_test_order(mt5_instance, symbol):
-                        if mt5_instance.symbol_select(symbol, True):
-                            log_and_print(f"Successfully selected {symbol} in Market Watch after test order", "DEBUG")
-                            return True
-                        else:
-                            log_and_print(f"Failed to select {symbol} in Market Watch even after test order", "ERROR")
-                            return False
-                time.sleep(MT5_RETRY_DELAY)
-        return False
 
     def normalize_row(self, row: Dict) -> Dict:
         """Normalize row data to handle string 'None' values and ensure correct types."""
@@ -325,14 +230,8 @@ class TradeRegulator:
             return False
 
     def save_to_json(self, file_path: str, data: List[Dict], append: bool = True) -> bool:
-        """Save data to a JSON file, creating parent directory if it doesn't exist."""
+        """Save data to a JSON file, optionally appending to existing data."""
         try:
-            # Ensure parent directory exists
-            parent_dir = os.path.dirname(file_path)
-            if parent_dir and not os.path.exists(parent_dir):
-                os.makedirs(parent_dir, exist_ok=True)
-                log_and_print(f"Created directory: {parent_dir}", "INFO")
-
             existing_data = []
             if append and os.path.exists(file_path):
                 try:
@@ -578,190 +477,6 @@ class TradeRegulator:
             "open_time": datetime.fromtimestamp(order.time_setup, pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00')
         }
 
-        # Add this helper method to the TradeRegulator class
-    
-        # New method to add to the TradeRegulator class
-    
-    def is_market_open(self, mt5_instance, symbol: str) -> bool:
-        """Check if the market is open for the given symbol based on recent tick data."""
-        try:
-            tick = mt5_instance.symbol_info_tick(symbol)
-            if tick is None:
-                log_and_print(f"No tick data available for {symbol}, assuming market closed", "DEBUG")
-                return False
-
-            # Get tick time in UTC
-            tick_datetime = datetime.fromtimestamp(tick.time, tz=timezone.utc)
-            now_utc = datetime.now(tz=timezone.utc)
-
-            # If tick is older than 5 minutes, consider market closed
-            time_diff = (now_utc - tick_datetime).total_seconds()
-            if time_diff > 300:  # 5 minutes threshold
-                log_and_print(f"Last tick for {symbol} is {time_diff:.0f}s old, assuming market closed", "DEBUG")
-                return False
-
-            log_and_print(f"Market open for {symbol} (last tick: {tick_datetime})", "DEBUG")
-            return True
-        except Exception as e:
-            log_and_print(f"Error checking market status for {symbol}: {str(e)}", "WARNING")
-            return False
-
-    # Updated helper method in the TradeRegulator class
-    async def cancel_order(self, mt5_instance, ticket: int, symbol: str) -> bool:
-        """Cancel a pending order by ticket, only if market is open."""
-        if not self.is_market_open(mt5_instance, symbol):
-            log_and_print(f"Market closed for {symbol}, skipping cancel for order {ticket}", "INFO")
-            return False
-
-        try:
-            request = {
-                "action": mt5_instance.TRADE_ACTION_REMOVE,
-                "order": ticket,
-                "symbol": symbol
-            }
-            result = mt5_instance.order_send(request)
-            if result.retcode == mt5_instance.TRADE_RETCODE_DONE:
-                log_and_print(f"Successfully canceled order {ticket} for {symbol}", "SUCCESS")
-                return True
-            else:
-                if result.retcode == 10018:  # TRADE_RETCODE_MARKET_CLOSED
-                    log_and_print(f"Market closed for {symbol}, cannot cancel order {ticket}", "INFO")
-                else:
-                    log_and_print(f"Failed to cancel order {ticket} for {symbol}: {result.retcode} - {result.comment}", "ERROR")
-                return False
-        except Exception as e:
-            log_and_print(f"Exception while canceling order {ticket} for {symbol}: {str(e)}", "ERROR")
-            return False
-    
-    # Add this main method to the TradeRegulator class
-    async def remove_duplicate_limit_orders(self, limit_orders: List[Dict], mt5_instance) -> List[Dict]:
-        """Remove duplicate or too-close limit orders of the same type for the same pair.
-        - Groups by (pair, order_type).
-        - For sell_limit: Sort entries ascending (low to high). Keep first, remove subsequent if entry <= prev_sl or too close to prev_entry.
-        - For buy_limit: Sort entries descending (high to low). Keep first, remove subsequent if entry >= prev_sl or too close to prev_entry.
-        - Potential SL calculated using SL_ADJUSTMENT_PERCENT as risk (initial breakeven adjustment).
-        - Too close: distance < 2 * min_stops_level (absolute price distance).
-        - Cancels the actual orders in MT5 and filters the list.
-        """
-        if not limit_orders:
-            return []
-
-        available_symbols = self.get_available_symbols(mt5_instance)
-        groups = defaultdict(list)
-        for order in limit_orders:
-            key = (order['pair'].lower(), order['order_type'].lower())
-            groups[key].append(order)
-
-        kept_orders = []
-        risk_percent = SL_ADJUSTMENT_PERCENT / 100.0  # e.g., 0.001 for 0.10%
-        min_close_factor = 2  # Too close if dist < min_stops_level * min_close_factor
-
-        for (pair, order_type), group in groups.items():
-            if len(group) <= 1:
-                kept_orders.extend(group)
-                continue
-
-            server_symbol = self.get_exact_symbol_match(pair, available_symbols)
-            if not server_symbol:
-                log_and_print(f"Skipping deduplication for {pair} ({order_type}): No symbol match", "WARNING")
-                kept_orders.extend(group)
-                continue
-
-            if not self.select_symbol(mt5_instance, server_symbol):
-                log_and_print(f"Skipping deduplication for {pair} ({order_type}): Failed to select symbol", "WARNING")
-                kept_orders.extend(group)
-                continue
-
-            # Add check for market open before processing group
-            if not self.is_market_open(mt5_instance, server_symbol):
-                log_and_print(f"Market closed for {server_symbol}, skipping deduplication for {pair} ({order_type})", "INFO")
-                kept_orders.extend(group)
-                continue
-
-            symbol_info = mt5_instance.symbol_info(server_symbol)
-            if not symbol_info:
-                log_and_print(f"Skipping deduplication for {pair} ({order_type}): No symbol info", "WARNING")
-                kept_orders.extend(group)
-                continue
-
-            point = symbol_info.point
-            tick_size = symbol_info.trade_tick_size
-            min_stops_dist = symbol_info.trade_stops_level * point
-            min_close_dist = min_stops_dist * min_close_factor
-
-            is_buy_limit = order_type == 'buy_limit'
-            # Sort: ascending for sell (low entry first), descending for buy (high entry first)
-            group.sort(key=lambda x: float(x['entry_price']), reverse=is_buy_limit)
-
-            kept = [group[0]]  # Always keep the first (closest to current price directionally)
-            log_and_print(f"Processing {len(group)} {order_type} orders for {pair} ({server_symbol})", "INFO")
-
-            for candidate in group[1:]:
-                entry = float(candidate['entry_price'])
-                prev = kept[-1]
-                prev_entry = float(prev['entry_price'])
-
-                # Calculate prev_sl (potential initial SL for breakeven adjustment)
-                if is_buy_limit:
-                    prev_sl = prev_entry * (1 - risk_percent)
-                else:
-                    prev_sl = prev_entry * (1 + risk_percent)
-                prev_sl = round(prev_sl / tick_size) * tick_size
-
-                # Check too close to previous entry
-                dist_to_prev = abs(entry - prev_entry)
-                if dist_to_prev < min_close_dist:
-                    log_and_print(f"Too close entry for {candidate['ticket']} ({pair}): dist {dist_to_prev:.5f} < {min_close_dist:.5f} to prev {prev_entry}", "INFO")
-                    await self.cancel_order(mt5_instance, candidate['ticket'], server_symbol)
-                    continue
-
-                # Check against prev_sl (risk zone overlap)
-                remove_due_to_risk = False
-                if is_buy_limit:
-                    # For buy: remove if not below prev_sl (i.e., entry >= prev_sl)
-                    if entry >= prev_sl:
-                        remove_due_to_risk = True
-                else:
-                    # For sell: remove if not above prev_sl (i.e., entry <= prev_sl)
-                    if entry <= prev_sl:
-                        remove_due_to_risk = True
-
-                if remove_due_to_risk:
-                    reason = "within previous order's risk zone (entry not sufficiently beyond SL)"
-                    log_and_print(f"Removing {candidate['ticket']} ({pair}) {order_type}: {reason} (entry {entry}, prev_sl {prev_sl})", "INFO")
-                    await self.cancel_order(mt5_instance, candidate['ticket'], server_symbol)
-                    continue
-
-                # All checks passed
-                kept.append(candidate)
-                log_and_print(f"Kept {candidate['ticket']} ({pair}) {order_type}: entry {entry} clear of prev_sl {prev_sl} and dist {dist_to_prev:.5f}", "DEBUG")
-
-            kept_orders.extend(kept)
-            removed_count = len(group) - len(kept)
-            if removed_count > 0:
-                log_and_print(f"Deduplicated {order_type} for {pair}: removed {removed_count}, kept {len(kept)}", "SUCCESS")
-
-        log_and_print(f"Overall limit order deduplication: {len(limit_orders) - len(kept_orders)} removed", "INFO")
-        return kept_orders
-
-    def match_trade_details(self, order1: Dict, order2: Dict, available_symbols: List[str], tolerance: float = 0.0001) -> bool:
-        """Check if two orders/trades match by pair, type, and entry price within tolerance."""
-        if order1.get('order_type', '').lower() != order2.get('order_type', '').lower():
-            return False
-        
-        sym1 = self.get_exact_symbol_match(order1['pair'].lower(), available_symbols)
-        sym2 = self.get_exact_symbol_match(order2['pair'].lower(), available_symbols)
-        if not (sym1 and sym2 and sym1.lower() == sym2.lower()):
-            return False
-        
-        try:
-            entry1 = float(order1['entry_price'])
-            entry2 = float(order2['entry_price'])
-            return abs(entry1 - entry2) < tolerance
-        except (ValueError, KeyError):
-            return False
-        
-    # Full Updated manage_trades_and_orders Method in TradeRegulator Class
     async def manage_trades_and_orders(self, account: Dict, mt5_instance) -> tuple[int, int]:
         """Manage running trades and pending orders, syncing with JSON files without duplicates."""
         account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
@@ -773,9 +488,6 @@ class TradeRegulator:
         running_trades = self.load_account_json(running_trades_file)
         closed_trades = self.load_account_json(closed_trades_file)
         limit_orders = self.load_account_json(limit_orders_file)
-
-        # Fetch available symbols
-        available_symbols = self.get_available_symbols(mt5_instance)
 
         # Fetch current positions and orders from MT5
         positions = mt5_instance.positions_get()
@@ -790,87 +502,30 @@ class TradeRegulator:
         closed_trade_tickets = {trade['ticket'] for trade in closed_trades}
         limit_order_tickets = {order['ticket'] for order in limit_orders}
 
-        current_order_tickets = {order.ticket for order in orders}
-
-        # Ensure no running or closed trade tickets are in limit orders (ticket-based, for safety)
-        filtered_limit_orders_by_ticket = [
-            order for order in limit_orders
-            if order['ticket'] not in running_trade_tickets and order['ticket'] not in closed_trade_tickets
-        ]
-        if len(filtered_limit_orders_by_ticket) < len(limit_orders):
-            removed_count = len(limit_orders) - len(filtered_limit_orders_by_ticket)
-            log_and_print(f"Removed {removed_count} limit orders with tickets matching running or closed trades for {account_key}", "INFO")
-            limit_orders = filtered_limit_orders_by_ticket
-            limit_order_tickets = {order['ticket'] for order in limit_orders}
-
-        # Find and cancel stale limit orders that match running or closed trades by details
-        all_historical_trades = running_trades + closed_trades
-        stale_limit_tickets = set()
-        canceled_count = 0
-        for lo in limit_orders:
-            if lo['ticket'] in current_order_tickets:  # Only if still pending in MT5
-                for ht in all_historical_trades:
-                    if self.match_trade_details(lo, ht, available_symbols):
-                        server_symbol = self.get_exact_symbol_match(lo['pair'], available_symbols)
-                        if server_symbol:
-                            if self.select_symbol(mt5_instance, server_symbol):
-                                if await self.cancel_order(mt5_instance, lo['ticket'], server_symbol):
-                                    log_and_print(f"Canceled stale limit order {lo['ticket']} for {lo['pair']} (matches historical trade {ht['ticket']})", "SUCCESS")
-                                    canceled_count += 1
-                                else:
-                                    log_and_print(f"Failed to cancel stale limit order {lo['ticket']} for {lo['pair']}", "WARNING")
-                            else:
-                                log_and_print(f"Failed to select symbol for canceling stale limit order {lo['ticket']}", "WARNING")
-                        stale_limit_tickets.add(lo['ticket'])
-                        break  # One match per limit order
-
-        if canceled_count > 0:
-            log_and_print(f"Canceled {canceled_count} stale limit orders matching historical trades for {account_key}", "INFO")
-
-        # Filter limit orders to remove matched stale ones
-        filtered_limit_orders = [lo for lo in limit_orders if lo['ticket'] not in stale_limit_tickets]
-        limit_orders = filtered_limit_orders
-        limit_order_tickets = {order['ticket'] for order in limit_orders}
-
         # Process running trades
         current_tickets = {position.ticket for position in positions}
         new_running_trades = []
         trades_to_close = []
-        signals_to_remove = []  # Indices of signals to remove after processing
 
         for position in positions:
-            json_symbol = position.symbol.lower()
+            symbol = position.symbol.lower()
             position_id = position.ticket
             order_type = position.type
             entry_price = position.price_open
 
             if order_type not in [mt5_instance.ORDER_TYPE_BUY, mt5_instance.ORDER_TYPE_SELL]:
-                log_and_print(f"Skipping position {position_id} for {json_symbol}: Not a buy or sell order (type: {order_type})", "DEBUG")
-                continue
-
-            # Validate and match symbol
-            server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
-            if not server_symbol:
-                error_message = f"No exact symbol match for '{json_symbol}' in MT5 server symbols"
-                log_and_print(error_message, "ERROR")
-                self.save_adjustment_error(account_key, json_symbol, position_id, error_message)
-                continue
-
-            # Ensure symbol is selected in Market Watch
-            if not self.select_symbol(mt5_instance, server_symbol):
-                error_message = f"Failed to select symbol '{server_symbol}' in Market Watch"
-                log_and_print(error_message, "ERROR")
-                self.save_adjustment_error(account_key, json_symbol, position_id, error_message)
+                log_and_print(f"Skipping position {position_id} for {symbol}: Not a buy or sell order (type: {order_type})", "DEBUG")
                 continue
 
             # Skip if already in running trades or closed trades
             if position_id in running_trade_tickets:
+                # Keep existing record
                 existing_trade = next((trade for trade in running_trades if trade['ticket'] == position_id), None)
                 if existing_trade:
                     new_running_trades.append(existing_trade)
                 continue
             if position_id in closed_trade_tickets:
-                log_and_print(f"Position {position_id} for {server_symbol} found in closed trades, skipping", "DEBUG")
+                log_and_print(f"Position {position_id} for {symbol} found in closed trades, skipping", "DEBUG")
                 continue
 
             is_buy = order_type == mt5_instance.ORDER_TYPE_BUY
@@ -878,53 +533,47 @@ class TradeRegulator:
 
             # Find matching signal in bouncestreamsignals.json
             matching_signal = None
-            matching_index = None
-            for i, signal in enumerate(self.signals):
-                signal_symbol = self.get_exact_symbol_match(signal['pair'].lower(), available_symbols)
-                if (signal_symbol and signal_symbol.lower() == server_symbol.lower() and 
+            for signal in self.signals:
+                if (signal['pair'].lower() == symbol and 
                     signal['order_type'].lower() == expected_order_type and 
                     abs(float(signal['entry_price']) - entry_price) < 0.0001):
                     matching_signal = signal
-                    matching_index = i
                     break
 
             if matching_signal:
+                # Copy signal to running trades
                 trade_record = matching_signal.copy()
-                trade_record['pair'] = server_symbol.lower()  # Use normalized symbol
                 trade_record['ticket'] = position_id
                 trade_record['open_time'] = datetime.fromtimestamp(position.time, pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00')
                 new_running_trades.append(trade_record)
-                log_and_print(f"Added position {position_id} for {server_symbol} to running trades", "INFO")
-                if matching_index is not None:
-                    signals_to_remove.append(matching_index)
+                log_and_print(f"Added position {position_id} for {symbol} to running trades", "INFO")
             else:
-                # For orphan positions, create record without adding to signals
-                trade_record = self.create_trade_record(position, mt5_instance)
-                trade_record['pair'] = server_symbol.lower()  # Use normalized symbol
-                new_running_trades.append(trade_record)
-                log_and_print(f"Added orphan position {position_id} for {server_symbol} to running trades (no signal match)", "INFO")
+                # No matching signal, create a new signal and add to bouncestream
+                new_signal = self.create_trade_record(position, mt5_instance)
+                if self.update_bouncestream_signals(new_signal):
+                    new_running_trades.append(new_signal)
+                    log_and_print(f"Created and added new signal for {symbol} (ticket: {position_id}) to running trades", "INFO")
+                else:
+                    log_and_print(f"Failed to update bouncestream signals for {symbol} (ticket: {position_id})", "ERROR")
+                    continue
 
-        # Remove matched signals for running trades
-        for i in sorted(signals_to_remove, reverse=True):
-            del self.signals[i]
-        signals_to_remove = []  # Reset for orders
-
-        # Check for stray running trades (limited to last 3 days)
-        three_days_ago = datetime.now(pytz.timezone('Africa/Lagos')) - timedelta(days=3)
+        # Check for stray running trades (not in current positions)
         for trade in running_trades:
             if trade['ticket'] not in current_tickets and trade['ticket'] not in closed_trade_tickets:
-                history = mt5_instance.history_deals_get(position=trade['ticket'], date_from=three_days_ago)
-                if history and any(d.entry == mt5_instance.DEAL_ENTRY_OUT for d in history):
+                # Check trade history to confirm if closed
+                history = mt5_instance.history_deals_get(position=trade['ticket'])
+                if history and any(deal.entry == mt5_instance.DEAL_ENTRY_OUT for deal in history):
                     closed_trade = trade.copy()
                     closed_trade['close_time'] = datetime.now(pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00')
                     trades_to_close.append(closed_trade)
-                    log_and_print(f"Moved trade {trade['ticket']} for {trade['pair']} to closed trades (closure in last 3 days)", "INFO")
+                    log_and_print(f"Moved trade {trade['ticket']} for {trade['pair']} to closed trades", "INFO")
                 else:
-                    new_running_trades.append(trade)
+                    new_running_trades.append(trade)  # Keep in running trades if not confirmed closed
 
         # Save updated running and closed trades
         self.save_to_json(running_trades_file, new_running_trades, append=False)
         if trades_to_close:
+            # Append to closed trades, but check for duplicates
             existing_closed_trades = self.load_account_json(closed_trades_file)
             existing_closed_tickets = {trade['ticket'] for trade in existing_closed_trades}
             unique_trades_to_close = [trade for trade in trades_to_close if trade['ticket'] not in existing_closed_tickets]
@@ -934,36 +583,23 @@ class TradeRegulator:
                 log_and_print(f"No new closed trades to add for {account_key}", "DEBUG")
 
         # Process pending orders
+        current_order_tickets = {order.ticket for order in orders}
         new_limit_orders = []
 
         for order in orders:
-            json_symbol = order.symbol.lower()
+            symbol = order.symbol.lower()
             order_id = order.ticket
             order_type = order.type
 
             if order_type not in [mt5_instance.ORDER_TYPE_BUY_LIMIT, mt5_instance.ORDER_TYPE_SELL_LIMIT,
                                 mt5_instance.ORDER_TYPE_BUY_STOP, mt5_instance.ORDER_TYPE_SELL_STOP]:
-                log_and_print(f"Skipping order {order_id} for {json_symbol}: Not a limit or stop order (type: {order_type})", "DEBUG")
-                continue
-
-            # Validate and match symbol
-            server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
-            if not server_symbol:
-                error_message = f"No exact symbol match for '{json_symbol}' in MT5 server symbols"
-                log_and_print(error_message, "ERROR")
-                self.save_adjustment_error(account_key, json_symbol, order_id, error_message)
-                continue
-
-            # Ensure symbol is selected in Market Watch
-            if not self.select_symbol(mt5_instance, server_symbol):
-                error_message = f"Failed to select symbol '{server_symbol}' in Market Watch"
-                log_and_print(error_message, "ERROR")
-                self.save_adjustment_error(account_key, json_symbol, order_id, error_message)
+                log_and_print(f"Skipping order {order_id} for {symbol}: Not a limit or stop order (type: {order_type})", "DEBUG")
                 continue
 
             # Skip if already in limit orders
             if order_id in limit_order_tickets:
-                existing_order = next((order_ for order_ in limit_orders if order_['ticket'] == order_id), None)
+                # Keep existing record
+                existing_order = next((order for order in limit_orders if order['ticket'] == order_id), None)
                 if existing_order:
                     new_limit_orders.append(existing_order)
                 continue
@@ -973,38 +609,29 @@ class TradeRegulator:
 
             # Find matching signal in bouncestreamsignals.json
             matching_signal = None
-            matching_index = None
-            for i, signal in enumerate(self.signals):
-                signal_symbol = self.get_exact_symbol_match(signal['pair'].lower(), available_symbols)
-                if (signal_symbol and signal_symbol.lower() == server_symbol.lower() and 
+            for signal in self.signals:
+                if (signal['pair'].lower() == symbol and 
                     signal['order_type'].lower() == expected_order_type and 
                     abs(float(signal['entry_price']) - order.price_open) < 0.0001):
                     matching_signal = signal
-                    matching_index = i
                     break
 
             if matching_signal:
+                # Copy signal to limit orders
                 order_record = matching_signal.copy()
-                order_record['pair'] = server_symbol.lower()  # Use normalized symbol
                 order_record['ticket'] = order_id
                 order_record['open_time'] = datetime.fromtimestamp(order.time_setup, pytz.timezone('Africa/Lagos')).strftime('%Y-%m-%d %H:%M:%S.%f+01:00')
                 new_limit_orders.append(order_record)
-                log_and_print(f"Added limit order {order_id} for {server_symbol} to limit orders", "INFO")
-                if matching_index is not None:
-                    signals_to_remove.append(matching_index)
+                log_and_print(f"Added limit order {order_id} for {symbol} to limit orders", "INFO")
             else:
-                # For orphan orders, create record without adding to signals
-                order_record = self.create_limit_order_record(order, mt5_instance)
-                order_record['pair'] = server_symbol.lower()  # Use normalized symbol
-                new_limit_orders.append(order_record)
-                log_and_print(f"Added orphan limit order {order_id} for {server_symbol} to limit orders (no signal match)", "INFO")
-
-        # Remove matched signals for limit orders
-        for i in sorted(signals_to_remove, reverse=True):
-            del self.signals[i]
-
-        # New: Remove duplicates and too-close limit orders before handling expirations
-        new_limit_orders = await self.remove_duplicate_limit_orders(new_limit_orders, mt5_instance)
+                # No matching signal, create a new signal and add to bouncestream
+                new_signal = self.create_limit_order_record(order, mt5_instance)
+                if self.update_bouncestream_signals(new_signal):
+                    new_limit_orders.append(new_signal)
+                    log_and_print(f"Created and added new limit order for {symbol} (ticket: {order_id}) to limit orders", "INFO")
+                else:
+                    log_and_print(f"Failed to update bouncestream signals for {symbol} (ticket: {order_id})", "ERROR")
+                    continue
 
         # Remove expired or canceled limit orders
         for order in limit_orders:
@@ -1016,36 +643,17 @@ class TradeRegulator:
         # Save updated limit orders
         self.save_to_json(limit_orders_file, new_limit_orders, append=False)
 
-        # Save updated signals file after removals
-        try:
-            signals_data = {"orders": self.signals}
-            with open(SIGNALS_FILE, 'w', encoding='utf-8') as file:
-                json.dump(signals_data, file, indent=4)
-            log_and_print(f"Updated {SIGNALS_FILE} with {len(self.signals)} signals after processing {account_key}", "INFO")
-        except Exception as e:
-            log_and_print(f"Error saving updated signals to {SIGNALS_FILE}: {str(e)}", "ERROR")
-
         return len(new_running_trades), len(new_limit_orders)
 
-    # Full Updated regulate_trades Method in TradeRegulator Class
     async def regulate_trades(self, account: Dict) -> tuple[int, int]:
         """Regulate stop-loss for running market orders based on signals and timeframe."""
         account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
         log_and_print(f"===== Regulating Trades for {account_key} =====", "TITLE")
         
-        # FIX: Re-initialize connection for this specific account/terminal before processing
-        if not self.mt5_manager.initialize_mt5(
-            server=account['broker_server'],
-            login=account['broker_loginid'],
-            password=account['broker_password'],
-            terminal_path=account['terminal_path'],
-            account_key=account_key
-        ):
-            log_and_print(f"Failed to re-initialize MT5 for {account_key}, skipping", "ERROR")
+        mt5_instance = self.mt5_manager.mt5_instances.get(account_key)
+        if not mt5_instance:
+            log_and_print(f"No MT5 instance found for {account_key}", "ERROR")
             return 0, 0
-
-        # Use global mt5 directly (now connected to this account's terminal)
-        mt5_instance = mt5
 
         # Manage trades and orders first
         running_trades_count, limit_orders_count = await self.manage_trades_and_orders(account, mt5_instance)
@@ -1057,9 +665,6 @@ class TradeRegulator:
         adjusted_orders = 0
         failed_adjustments = 0
 
-        # Fetch available symbols
-        available_symbols = self.get_available_symbols(mt5_instance)
-
         try:
             positions = mt5_instance.positions_get()
             if not positions:
@@ -1070,7 +675,7 @@ class TradeRegulator:
 
             for position in positions:
                 try:
-                    json_symbol = position.symbol.lower()
+                    symbol = position.symbol.lower()
                     position_id = position.ticket
                     order_type = position.type
                     entry_price = position.price_open
@@ -1078,26 +683,7 @@ class TradeRegulator:
                     current_tp = position.tp
 
                     if order_type not in [mt5_instance.ORDER_TYPE_BUY, mt5_instance.ORDER_TYPE_SELL]:
-                        log_and_print(f"Skipping position {position_id} for {json_symbol}: Not a buy or sell order (type: {order_type})", "DEBUG")
-                        continue
-
-                    # Validate and match symbol
-                    server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
-                    if not server_symbol:
-                        error_message = f"No exact symbol match for '{json_symbol}' in MT5 server symbols"
-                        log_and_print(error_message, "ERROR")
-                        self.save_adjustment_error(account_key, json_symbol, position_id, error_message)
-                        failed_adjustments += 1
-                        self.total_orders_failed += 1
-                        continue
-
-                    # Ensure symbol is selected in Market Watch
-                    if not self.select_symbol(mt5_instance, server_symbol):
-                        error_message = f"Failed to select symbol '{server_symbol}' in Market Watch"
-                        log_and_print(error_message, "ERROR")
-                        self.save_adjustment_error(account_key, json_symbol, position_id, error_message)
-                        failed_adjustments += 1
-                        self.total_orders_failed += 1
+                        log_and_print(f"Skipping position {position_id} for {symbol}: Not a buy or sell order (type: {order_type})", "DEBUG")
                         continue
 
                     is_buy = order_type == mt5_instance.ORDER_TYPE_BUY
@@ -1107,41 +693,40 @@ class TradeRegulator:
                     # Find matching signal in running_trades JSON
                     matching_signal = None
                     for trade in running_trades:
-                        trade_symbol = self.get_exact_symbol_match(trade['pair'].lower(), available_symbols)
-                        if (trade_symbol and trade_symbol.lower() == server_symbol.lower() and 
+                        if (trade['pair'].lower() == symbol and 
                             trade['order_type'].lower() == expected_order_type and 
                             trade['ticket'] == position_id):
                             matching_signal = trade
                             break
 
                     if not matching_signal:
-                        log_and_print(f"No matching running trade found for position {position_id} ({server_symbol}, entry: {entry_price})", "DEBUG")
+                        log_and_print(f"No matching running trade found for position {position_id} ({symbol}, entry: {entry_price})", "DEBUG")
                         continue
 
                     timeframe_str = matching_signal['timeframe']
                     timeframe = self.get_timeframe(timeframe_str)
                     if not timeframe:
-                        error_message = f"Invalid timeframe '{timeframe_str}' for position {position_id} ({server_symbol})"
+                        error_message = f"Invalid timeframe '{timeframe_str}' for position {position_id} ({symbol})"
                         log_and_print(error_message, "ERROR")
-                        self.save_adjustment_error(account_key, server_symbol, position_id, error_message)
+                        self.save_adjustment_error(account_key, symbol, position_id, error_message)
                         failed_adjustments += 1
                         self.total_orders_failed += 1
                         continue
 
-                    symbol_info = mt5_instance.symbol_info(server_symbol)
+                    symbol_info = mt5_instance.symbol_info(symbol)
                     if not symbol_info:
-                        error_message = f"Cannot retrieve symbol info for {server_symbol}"
+                        error_message = f"Cannot retrieve symbol info for {symbol}"
                         log_and_print(error_message, "ERROR")
-                        self.save_adjustment_error(account_key, server_symbol, position_id, error_message)
+                        self.save_adjustment_error(account_key, symbol, position_id, error_message)
                         failed_adjustments += 1
                         self.total_orders_failed += 1
                         continue
 
-                    tick = mt5_instance.symbol_info_tick(server_symbol)
+                    tick = mt5_instance.symbol_info_tick(symbol)
                     if not tick:
-                        error_message = f"Cannot retrieve tick data for {server_symbol}"
+                        error_message = f"Cannot retrieve tick data for {symbol}"
                         log_and_print(error_message, "ERROR")
-                        self.save_adjustment_error(account_key, server_symbol, position_id, error_message)
+                        self.save_adjustment_error(account_key, symbol, position_id, error_message)
                         failed_adjustments += 1
                         self.total_orders_failed += 1
                         continue
@@ -1149,14 +734,18 @@ class TradeRegulator:
                     current_price = tick.bid if is_sell else tick.ask
                     tick_size = symbol_info.trade_tick_size
                     point = symbol_info.point
-                    min_sl_distance = symbol_info.trade_stops_level * point
+                    stops_level = symbol_info.trade_stops_level * point
 
-                    # FIX: Add buffer for synthetic indices (e.g., Drift Switch)
-                    if 'drift' in server_symbol.lower() or 'synthetic' in server_symbol.lower():
-                        min_sl_distance *= 1.2  # 20% extra buffer for high-vol synthetics
-                        log_and_print(f"Synthetic index detected ({server_symbol}): Using buffered min SL distance {min_sl_distance}", "DEBUG")
+                    rates = mt5_instance.copy_rates_from_pos(symbol, timeframe, 1, 1)
+                    if not rates or len(rates) == 0:
+                        error_message = f"Failed to retrieve {timeframe_str} candle data for {symbol}"
+                        log_and_print(error_message, "ERROR")
+                        self.save_adjustment_error(account_key, symbol, position_id, error_message)
+                        failed_adjustments += 1
+                        self.total_orders_failed += 1
+                        continue
 
-                    log_and_print(f"Min SL distance required: {min_sl_distance}, Current price: {current_price}, Entry: {entry_price}", "DEBUG")
+                    close_price = rates[0]['close']
 
                     entry_price_signal = float(matching_signal['entry_price'])
                     ratio_0_5_price = float(matching_signal['ratio_0_5_price'])
@@ -1169,186 +758,103 @@ class TradeRegulator:
                     new_sl = 0.0
                     adjustment_needed = False
                     adjustment_reason = ""
-                    eligible_ratio = None
-                    towards_threshold = None  # For descriptive messaging
 
-                    # Determine price direction and eligibility for adjustment using current_price
-                    is_price_toward_profit = (is_buy and current_price > entry_price_signal) or (is_sell and current_price < entry_price_signal)
-                    is_price_toward_stoploss = (is_buy and current_price <= entry_price_signal) or (is_sell and current_price >= entry_price_signal)
-
-                    if is_price_toward_stoploss:
-                        if current_sl != 0.0:
-                            # Check if between SL and entry
-                            if is_buy:
-                                if current_sl < current_price < entry_price_signal:
-                                    dist_to_sl = current_price - current_sl
-                                    dist_to_entry = entry_price_signal - current_price
-                                    closer_to = "stop-loss" if dist_to_sl < dist_to_entry else "entry"
-                                    log_and_print(f"Current price {current_price} is between stop-loss {current_sl} and entry {entry_price_signal}, "
-                                                f"closer to {closer_to}, waiting for price to move {'above' if is_buy else 'below'} entry towards eligible ratios", "INFO")
-                                    continue
-                            else:  # sell
-                                if entry_price_signal < current_price < current_sl:
-                                    dist_to_entry = current_price - entry_price_signal
-                                    dist_to_sl = current_sl - current_price
-                                    closer_to = "entry" if dist_to_entry < dist_to_sl else "stop-loss"
-                                    log_and_print(f"Current price {current_price} is between entry {entry_price_signal} and stop-loss {current_sl}, "
-                                                f"closer to {closer_to}, waiting for price to move {'below' if is_sell else 'above'} entry towards eligible ratios", "INFO")
-                                    continue
-                        direction_word = "above" if is_sell else "below"
-                        log_and_print(f"No stop-loss adjustment for position {position_id} ({server_symbol}): "
-                                    f"Current price {current_price} is {direction_word} entry {entry_price_signal}, moving toward stop-loss, "
-                                    f"waiting for price to move {'below' if is_sell else 'above'} entry toward ratios", "INFO")
-                        continue
-
-                    # Adjustment logic using current_price for ratio checks
-                    direction_word = "above" if is_buy else "below"
-                    opposite_direction_word = "below" if is_buy else "above"
                     if is_buy:
-                        if current_price > ratio_2_price:
+                        if close_price > ratio_2_price:
                             new_sl = round(ratio_1_price / tick_size) * tick_size
-                            eligible_ratio = "1:2 RR"
-                            towards_threshold = "1:1 RR"  # Already beyond 1:2, but for messaging if needed
                             if current_sl == 0.0 or (current_sl > 0 and current_sl < new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} 1:2 RR (current: {current_price}, ratio_2: {ratio_2_price})"
-                        elif current_price > ratio_1_price:
+                                adjustment_reason = f"beyond 1:2 RR (close: {close_price}, ratio_2: {ratio_2_price})"
+                        elif close_price > ratio_1_price:
                             new_sl = round(ratio_0_5_price / tick_size) * tick_size
-                            eligible_ratio = "1:1 RR"
-                            towards_threshold = "1:2 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl < new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} 1:1 RR (current: {current_price}, ratio_1: {ratio_1_price})"
-                        elif current_price > ratio_0_5_price:
+                                adjustment_reason = f"beyond 1:1 RR (close: {close_price}, ratio_1: {ratio_1_price})"
+                        elif close_price > ratio_0_5_price:
                             new_sl = round(ratio_0_25_price / tick_size) * tick_size
-                            eligible_ratio = "1:0.5 RR"
-                            towards_threshold = "1:1 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl < new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} 1:0.5 RR (current: {current_price}, ratio_0_5: {ratio_0_5_price})"
-                        elif current_price > entry_price_signal:
+                                adjustment_reason = f"beyond 1:0.5 RR (close: {close_price}, ratio_0_5: {ratio_0_5_price})"
+                        elif close_price > entry_price_signal:
                             new_sl = round((entry_price * (1 + SL_ADJUSTMENT_PERCENT / 100)) / tick_size) * tick_size
-                            eligible_ratio = "entry price"
-                            towards_threshold = "1:0.5 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl < new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} entry price (current: {current_price}, entry: {entry_price_signal})"
-
-                    # Adjustment logic for sell orders (price below entry, moving toward profit)
+                                adjustment_reason = f"above entry price (close: {close_price}, entry: {entry_price_signal})"
                     elif is_sell:
-                        if current_price < ratio_2_price:
+                        if close_price < ratio_2_price:
                             new_sl = round(ratio_1_price / tick_size) * tick_size
-                            eligible_ratio = "1:2 RR"
-                            towards_threshold = "1:1 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl > new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} 1:2 RR (current: {current_price}, ratio_2: {ratio_2_price})"
-                        elif current_price < ratio_1_price:
+                                adjustment_reason = f"beyond 1:2 RR (close: {close_price}, ratio_2: {ratio_2_price})"
+                        elif close_price < ratio_1_price:
                             new_sl = round(ratio_0_5_price / tick_size) * tick_size
-                            eligible_ratio = "1:1 RR"
-                            towards_threshold = "1:2 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl > new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} 1:1 RR (current: {current_price}, ratio_1: {ratio_1_price})"
-                        elif current_price < ratio_0_5_price:
+                                adjustment_reason = f"beyond 1:1 RR (close: {close_price}, ratio_1: {ratio_1_price})"
+                        elif close_price < ratio_0_5_price:
                             new_sl = round(ratio_0_25_price / tick_size) * tick_size
-                            eligible_ratio = "1:0.5 RR"
-                            towards_threshold = "1:1 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl > new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} 1:0.5 RR (current: {current_price}, ratio_0_5: {ratio_0_5_price})"
-                        elif current_price < entry_price_signal:
+                                adjustment_reason = f"beyond 1:0.5 RR (close: {close_price}, ratio_0_5: {ratio_0_5_price})"
+                        elif close_price < entry_price_signal:
                             new_sl = round((entry_price * (1 - SL_ADJUSTMENT_PERCENT / 100)) / tick_size) * tick_size
-                            eligible_ratio = "entry price"
-                            towards_threshold = "1:0.5 RR"
                             if current_sl == 0.0 or (current_sl > 0 and current_sl > new_sl):
                                 adjustment_needed = True
-                                adjustment_reason = f"{direction_word} entry price (current: {current_price}, entry: {entry_price_signal})"
+                                adjustment_reason = f"below entry price (close: {close_price}, entry: {entry_price_signal})"
 
                     if not adjustment_needed:
-                        log_and_print(f"No stop-loss adjustment needed for position {position_id} ({server_symbol})", "DEBUG")
+                        log_and_print(f"No stop-loss adjustment needed for position {position_id} ({symbol})", "DEBUG")
                         continue
 
-                    # FIX: Enhanced validation with logging
-                    actual_distance = abs(current_price - new_sl)
-                    log_and_print(f"Proposed SL: {new_sl}, Actual distance to current: {actual_distance}, Required min: {min_sl_distance}", "DEBUG")
-
-                    # Validate stop-loss distance against current price (not entry) - stricter check
-                    too_close = False
-                    if is_buy:
-                        if new_sl >= current_price - min_sl_distance:
-                            too_close = True
-                    else:  # sell
-                        if new_sl <= current_price + min_sl_distance:
-                            too_close = True
-
-                    if too_close:
-                        threshold_desc = towards_threshold if towards_threshold else "entry price"
-                        eligible_desc = f"break-even { '+' if is_buy else '-' }{SL_ADJUSTMENT_PERCENT}%" if eligible_ratio == "entry price" else eligible_ratio
-                        towards_desc = towards_threshold if towards_threshold else 'profit ratios'
-                        further_direction = direction_word
-                        log_and_print(f"Stop-loss {new_sl} too close to current price {current_price} for {server_symbol} "
-                                    f"({ 'buy' if is_buy else 'sell' }, min distance: {min_sl_distance}, actual: {actual_distance}), current price {direction_word} {threshold_desc} "
-                                    f"and towards {towards_desc}, "
-                                    f"waiting for price to move further {further_direction} {eligible_desc} ({new_sl}) to adjust stop-loss", "INFO")
-                        continue  # Do not increment failed_adjustments
+                    if is_sell:
+                        if new_sl < entry_price + stops_level:
+                            error_message = f"New stop-loss {new_sl} too close to entry {entry_price} for {symbol} (sell, min distance: {stops_level})"
+                            log_and_print(error_message, "WARNING")
+                            self.save_adjustment_error(account_key, symbol, position_id, error_message)
+                            failed_adjustments += 1
+                            self.total_orders_failed += 1
+                            continue
+                    elif is_buy:
+                        if new_sl > entry_price - stops_level:
+                            error_message = f"New stop-loss {new_sl} too close to entry {entry_price} for {symbol} (buy, min distance: {stops_level})"
+                            log_and_print(error_message, "WARNING")
+                            self.save_adjustment_error(account_key, symbol, position_id, error_message)
+                            failed_adjustments += 1
+                            self.total_orders_failed += 1
+                            continue
 
                     request = {
                         "action": mt5_instance.TRADE_ACTION_SLTP,
                         "position": position_id,
-                        "symbol": server_symbol,
+                        "symbol": symbol,
                         "sl": new_sl,
                         "tp": current_tp
                     }
 
-                    log_and_print(f"Attempting to adjust stop-loss for position {position_id} ({server_symbol}) to {new_sl} ({adjustment_reason})", "INFO")
+                    log_and_print(f"Attempting to adjust stop-loss for position {position_id} ({symbol}) to {new_sl} ({adjustment_reason})", "INFO")
 
-                    sl_buffer = min_sl_distance  # Buffer for retries
                     for attempt in range(1, MAX_RETRIES + 1):
-                        # FIX: On retry for 10016, widen SL slightly
-                        adjusted_sl = new_sl
-                        if attempt > 1:
-                            if is_buy:
-                                adjusted_sl += sl_buffer  # Move SL further up for buys
-                            else:
-                                adjusted_sl -= sl_buffer  # Move SL further down for sells
-                            adjusted_sl = round(adjusted_sl / tick_size) * tick_size
-                            log_and_print(f"Retry {attempt}: Widened SL to {adjusted_sl} (buffer: {sl_buffer})", "INFO")
-                            request["sl"] = adjusted_sl
-
                         result = mt5_instance.order_send(request)
                         if result.retcode == mt5_instance.TRADE_RETCODE_DONE:
-                            log_and_print(f"Successfully adjusted stop-loss for position {position_id} ({server_symbol}) to {adjusted_sl or new_sl} ({adjustment_reason})", "SUCCESS")
+                            log_and_print(f"Successfully adjusted stop-loss for position {position_id} ({symbol}) to {new_sl} ({adjustment_reason})", "SUCCESS")
                             adjusted_orders += 1
                             self.total_orders_adjusted += 1
                             break
                         else:
-                            error_code = result.retcode
-                            error_message = result.comment
-                            full_error = f"Failed to adjust stop-loss for position {position_id} ({server_symbol}) on attempt {attempt}: {error_code}, {error_message}"
-                            log_and_print(full_error, "ERROR")
-                            self.save_adjustment_error(account_key, server_symbol, position_id, full_error)
-                            
-                            # FIX: Handle 10016 as market condition - no failure count, specific log
-                            if error_code == 10016:  # Invalid stops - too close due to market conditions
-                                threshold_desc = towards_threshold if towards_threshold else "entry price"
-                                eligible_desc = f"break-even { '+' if is_buy else '-' }{SL_ADJUSTMENT_PERCENT}%" if eligible_ratio == "entry price" else eligible_ratio
-                                further_direction = direction_word
-                                log_and_print(f"Too close to modify SL for {server_symbol} (market condition: invalid stops). Waiting for current price to move further {further_direction} toward profit for adjustable SL at {eligible_desc} level.", "INFO")
-                                break  # Stop retries; respect market - don't count as failed
-                            
+                            error_message = f"Failed to adjust stop-loss for position {position_id} ({symbol}) on attempt {attempt}: {result.retcode}, {result.comment}"
+                            log_and_print(error_message, "ERROR")
                             if attempt == MAX_RETRIES:
-                                if error_code != 10016:  # Only count non-distance errors as failed
-                                    failed_adjustments += 1
-                                    self.total_orders_failed += 1
+                                self.save_adjustment_error(account_key, symbol, position_id, error_message)
+                                failed_adjustments += 1
+                                self.total_orders_failed += 1
                             else:
                                 log_and_print(f"Retrying adjustment after {MT5_RETRY_DELAY} seconds...", "INFO")
                                 await asyncio.sleep(MT5_RETRY_DELAY)
 
                 except Exception as e:
-                    error_message = f"Error processing position {position_id} for {server_symbol}: {str(e)}"
+                    error_message = f"Error processing position {position_id} for {symbol}: {str(e)}"
                     log_and_print(error_message, "ERROR")
-                    self.save_adjustment_error(account_key, server_symbol, position_id, error_message)
+                    self.save_adjustment_error(account_key, symbol, position_id, error_message)
                     failed_adjustments += 1
                     self.total_orders_failed += 1
 
@@ -1470,3 +976,56 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+[ 2025-09-20 13:26:04 ] │ INFO    │     Processing account: user_1
+2025-09-20 13:26:04,995 [INFO] Processing account: user_1
+[ 2025-09-20 13:26:04 ] │ TITLE   │     ===== Regulating Trades for user_1 =====
+2025-09-20 13:26:04,995 [INFO] ===== Regulating Trades for user_1 =====
+[ 2025-09-20 13:26:05 ] │ INFO    │     Saved 1 records to C:\xampp\htdocs\CIPHER\cipher trader\market\runningtrades\user_1_runningtrades.json
+2025-09-20 13:26:05,113 [INFO] Saved 1 records to C:\xampp\htdocs\CIPHER\cipher trader\market\runningtrades\user_1_runningtrades.json
+[ 2025-09-20 13:26:05 ] │ INFO    │     Saved 7442 records to C:\xampp\htdocs\CIPHER\cipher trader\market\limitorders\user_1_limitorders.json
+2025-09-20 13:26:05,528 [INFO] Saved 7442 records to C:\xampp\htdocs\CIPHER\cipher trader\market\limitorders\user_1_limitorders.json
+[ 2025-09-20 13:26:05 ] │ INFO    │     Managed 1 running trades and 7442 limit orders for user_1
+2025-09-20 13:26:05,528 [INFO] Managed 1 running trades and 7442 limit orders for user_1
+[ 2025-09-20 13:26:05 ] │ INFO    │     Found 1 open positions for user_1
+2025-09-20 13:26:05,528 [INFO] Found 1 open positions for user_1
+[ 2025-09-20 13:26:05 ] │ ERROR   │     Cannot retrieve symbol info for volatility 100 (1s) index
+2025-09-20 13:26:05,528 [ERROR] Cannot retrieve symbol info for volatility 100 (1s) index
+[ 2025-09-20 13:26:05 ] │ ERROR   │     Error saving to C:\xampp\htdocs\CIPHER\cipherdb\cipheruserdb\errors\stoploss_adjustment_errors.json: [Errno 2] No such file or directory: 'C:\\xampp\\htdocs\\CIPHER\\cipherdb\\cipheruserdb\\errors\\stoploss_adjustment_errors.json'
+2025-09-20 13:26:05,544 [ERROR] Error saving to C:\xampp\htdocs\CIPHER\cipherdb\cipheruserdb\errors\stoploss_adjustment_errors.json: [Errno 2] No such file or directory: 'C:\\xampp\\htdocs\\CIPHER\\cipherdb\\cipheruserdb\\errors\\stoploss_adjustment_errors.json'
+[ 2025-09-20 13:26:05 ] │ INFO    │     Regulation summary for user_1: 0 positions adjusted, 1 failed
+2025-09-20 13:26:05,544 [INFO] Regulation summary for user_1: 0 positions adjusted, 1 failed
+[ 2025-09-20 13:26:05 ] │ INFO    │     Account user_1 Summary: 0 positions adjusted, 1 failed adjustments
+2025-09-20 13:26:05,544 [INFO] Account user_1 Summary: 0 positions adjusted, 1 failed adjustments
+[ 2025-09-20 13:26:05 ] │ INFO    │     Processing account: user_1_sub_1
+2025-09-20 13:26:05,544 [INFO] Processing account: user_1_sub_1
+[ 2025-09-20 13:26:05 ] │ TITLE   │     ===== Regulating Trades for user_1_sub_1 =====
+2025-09-20 13:26:05,544 [INFO] ===== Regulating Trades for user_1_sub_1 =====
+[ 2025-09-20 13:26:05 ] │ INFO    │     Saved 1 records to C:\xampp\htdocs\CIPHER\cipher trader\market\runningtrades\user_1_sub_1_runningtrades.json
+2025-09-20 13:26:05,661 [INFO] Saved 1 records to C:\xampp\htdocs\CIPHER\cipher trader\market\runningtrades\user_1_sub_1_runningtrades.json
+[ 2025-09-20 13:26:06 ] │ INFO    │     Saved 7930 records to C:\xampp\htdocs\CIPHER\cipher trader\market\limitorders\user_1_sub_1_limitorders.json
+2025-09-20 13:26:06,121 [INFO] Saved 7930 records to C:\xampp\htdocs\CIPHER\cipher trader\market\limitorders\user_1_sub_1_limitorders.json
+[ 2025-09-20 13:26:06 ] │ INFO    │     Managed 1 running trades and 7930 limit orders for user_1_sub_1
+2025-09-20 13:26:06,127 [INFO] Managed 1 running trades and 7930 limit orders for user_1_sub_1
+[ 2025-09-20 13:26:06 ] │ INFO    │     Found 1 open positions for user_1_sub_1
+2025-09-20 13:26:06,132 [INFO] Found 1 open positions for user_1_sub_1
+[ 2025-09-20 13:26:06 ] │ ERROR   │     Cannot retrieve symbol info for volatility 100 (1s) index
+2025-09-20 13:26:06,132 [ERROR] Cannot retrieve symbol info for volatility 100 (1s) index
+[ 2025-09-20 13:26:06 ] │ ERROR   │     Error saving to C:\xampp\htdocs\CIPHER\cipherdb\cipheruserdb\errors\stoploss_adjustment_errors.json: [Errno 2] No such file or directory: 'C:\\xampp\\htdocs\\CIPHER\\cipherdb\\cipheruserdb\\errors\\stoploss_adjustment_errors.json'
+2025-09-20 13:26:06,132 [ERROR] Error saving to C:\xampp\htdocs\CIPHER\cipherdb\cipheruserdb\errors\stoploss_adjustment_errors.json: [Errno 2] No such file or directory: 'C:\\xampp\\htdocs\\CIPHER\\cipherdb\\cipheruserdb\\errors\\stoploss_adjustment_errors.json'
+[ 2025-09-20 13:26:06 ] │ INFO    │     Regulation summary for user_1_sub_1: 0 positions adjusted, 1 failed
+2025-09-20 13:26:06,132 [INFO] Regulation summary for user_1_sub_1: 0 positions adjusted, 1 failed
+[ 2025-09-20 13:26:06 ] │ INFO    │     Account user_1_sub_1 Summary: 0 positions adjusted, 1 failed adjustments
+2025-09-20 13:26:06,132 [INFO] Account user_1_sub_1 Summary: 0 positions adjusted, 1 failed adjustments
+[ 2025-09-20 13:26:06 ] │ INFO    │     Cycle 28 Summary: 0 positions adjusted, 2 failed adjustments
+2025-09-20 13:26:06,132 [INFO] Cycle 28 Summary: 0 positions adjusted, 2 failed adjustments
+[ 2025-09-20 13:26:06 ] │ INFO    │     Total Positions Adjusted (All Cycles): 0
+2025-09-20 13:26:06,132 [INFO] Total Positions Adjusted (All Cycles): 0
+[ 2025-09-20 13:26:06 ] │ INFO    │     Total Failed Adjustments (All Cycles): 56
+2025-09-20 13:26:06,132 [INFO] Total Failed Adjustments (All Cycles): 56
+[ 2025-09-20 13:26:06 ] │ INFO    │     Next check in 30 seconds...
+2025-09-20 13:26:06,148 [INFO] Next check in 30 seconds...
+
+
+i want same method to be used here to select symbols too and also create jsons if not exists, provide the full functions responsible
