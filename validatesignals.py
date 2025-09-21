@@ -463,7 +463,8 @@ def filter_failed_orders():
     return filtered_data
 
 def place_pending_order(symbol, order_type, entry_price, profit_price, stop_loss, lot_size, allowed_risk):
-    """Validate a pending order (buy_limit or sell_limit) and mark as success if valid, otherwise save errors to JSON."""
+    """Validate a pending order (buy_limit or sell_limit), adjust entry if needed to meet stops_level, 
+    and mark as success if valid, otherwise save errors to JSON."""
     try:
         # Ensure symbol is selected and visible
         if not mt5.symbol_select(symbol, True):
@@ -498,12 +499,12 @@ def place_pending_order(symbol, order_type, entry_price, profit_price, stop_loss
         current_bid = tick.bid
         current_ask = tick.ask
 
-        # Normalize prices to tick size
+        # Normalize prices to tick size (initial)
         entry_price = round(float(entry_price) / tick_size) * tick_size
         profit_price = round(float(profit_price) / tick_size) * tick_size if profit_price else 0.0
         stop_loss = round(float(stop_loss) / tick_size) * tick_size if stop_loss else 0.0
 
-        # Log price details for debugging
+        # Log initial price details for debugging
         log_and_print(
             f"Validating order for {symbol}: "
             f"Order Type={order_type}, Entry={entry_price}, TP={profit_price}, SL={stop_loss}, "
@@ -512,66 +513,85 @@ def place_pending_order(symbol, order_type, entry_price, profit_price, stop_loss
             "DEBUG"
         )
 
-        # Validate order type
+        # Validate/adjust order type
         is_buy_limit = order_type.lower() == "buy_limit"
         is_sell_limit = order_type.lower() == "sell_limit"
-
-        # Validate entry price
-        if is_buy_limit:
-            # Buy limit: entry price must be below current ask price by at least stops_level
-            min_price = current_ask - stops_level
-            if entry_price > min_price:
-                error_message = (
-                    f"Invalid buy_limit entry price for {symbol}. "
-                    f"Entry: {entry_price}, must be <= {min_price} (ask: {current_ask}, stops_level: {stops_level})"
-                )
-                log_and_print(error_message, "ERROR")
-                return False, None, error_message, "invalid_entry"
-        elif is_sell_limit:
-            # Sell limit: entry price must be above current bid price by at least stops_level
-            max_price = current_bid + stops_level
-            if entry_price < max_price:
-                error_message = (
-                    f"Invalid sell_limit entry price for {symbol}. "
-                    f"Entry: {entry_price}, must be >= {max_price} (bid: {current_bid}, stops_level: {stops_level})"
-                )
-                log_and_print(error_message, "ERROR")
-                return False, None, error_message, "invalid_entry"
-        else:
+        if not (is_buy_limit or is_sell_limit):
             error_message = f"Unsupported order type {order_type} for {symbol}"
             log_and_print(error_message, "ERROR")
             return False, None, error_message, "unknown"
 
-        # Validate stop-loss and take-profit
+        # Dynamically adjust entry price to meet stops_level if invalid
+        adjustment_made = False
+        original_entry = entry_price
+        if is_buy_limit:
+            # Buy limit: entry must be below current ask by at least stops_level
+            min_price = current_ask - stops_level
+            if entry_price > min_price:
+                # Adjust entry down to the maximum valid level (just below ask by stops_level)
+                entry_price = min_price
+                adjustment_made = True
+                log_and_print(
+                    f"Adjusted buy_limit entry for {symbol} from {original_entry} to {entry_price} "
+                    f"(to meet stops_level: <= {min_price})",
+                    "WARNING"
+                )
+        elif is_sell_limit:
+            # Sell limit: entry must be above current bid by at least stops_level
+            max_price = current_bid + stops_level
+            if entry_price < max_price:
+                # Adjust entry up to the minimum valid level (just above bid by stops_level)
+                entry_price = max_price
+                adjustment_made = True
+                log_and_print(
+                    f"Adjusted sell_limit entry for {symbol} from {original_entry} to {entry_price} "
+                    f"(to meet stops_level: >= {max_price})",
+                    "WARNING"
+                )
+
+        # Re-normalize adjusted entry to tick size
+        entry_price = round(entry_price / tick_size) * tick_size
+
+        # Now validate/adjust SL and TP relative to ADJUSTED entry
+        # (Re-normalize them again if needed)
+        profit_price = round(float(profit_price) / tick_size) * tick_size if profit_price else 0.0
+        stop_loss = round(float(stop_loss) / tick_size) * tick_size if stop_loss else 0.0
+
         if is_buy_limit:
             # For buy_limit: SL <= entry_price, TP >= entry_price
             if stop_loss and stop_loss > entry_price:
-                error_message = (
-                    f"Invalid stop-loss for {symbol} (buy_limit). "
-                    f"SL: {stop_loss}, must be <= {entry_price}"
+                # Adjust SL down to valid level (but check if it violates risk)
+                original_sl = stop_loss
+                stop_loss = entry_price  # Minimal adjustment; you could subtract a buffer
+                if abs(entry_price - stop_loss) < stops_level:  # If still too close after adjust
+                    error_message = (
+                        f"Cannot adjust SL for {symbol} (buy_limit) without violating stops_level. "
+                        f"Original SL: {original_sl}, Adjusted Entry: {entry_price}"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "adjusted_risk_violation"
+                log_and_print(
+                    f"Adjusted invalid SL for {symbol} (buy_limit) from {original_sl} to {stop_loss}",
+                    "WARNING"
                 )
-                log_and_print(error_message, "ERROR")
-                return False, None, error_message, "stop_loss"
             if profit_price and profit_price < entry_price:
-                error_message = (
-                    f"Invalid take-profit for {symbol} (buy_limit). "
-                    f"TP: {profit_price}, must be >= {entry_price}"
+                profit_price = entry_price + stops_level  # Minimal valid TP
+                log_and_print(
+                    f"Adjusted invalid TP for {symbol} (buy_limit) to {profit_price} (min distance)",
+                    "WARNING"
                 )
-                log_and_print(error_message, "ERROR")
-                return False, None, error_message, "stop_loss"
-            # Check stop-loss distance
+            # Check distances (post-adjustment)
             if stop_loss and abs(entry_price - stop_loss) < stops_level:
                 error_message = (
-                    f"Stop-loss too close to entry price for {symbol}. "
+                    f"SL too close to adjusted entry for {symbol}. "
                     f"SL: {stop_loss}, Entry: {entry_price}, Distance: {abs(entry_price - stop_loss)}, "
                     f"Required: >= {stops_level}"
                 )
                 log_and_print(error_message, "ERROR")
                 return False, None, error_message, "stop_loss"
-            # Check take-profit distance (if applicable)
             if profit_price and abs(profit_price - entry_price) < stops_level:
                 error_message = (
-                    f"Take-profit too close to entry price for {symbol}. "
+                    f"TP too close to adjusted entry for {symbol}. "
                     f"TP: {profit_price}, Entry: {entry_price}, Distance: {abs(profit_price - entry_price)}, "
                     f"Required: >= {stops_level}"
                 )
@@ -580,41 +600,48 @@ def place_pending_order(symbol, order_type, entry_price, profit_price, stop_loss
         elif is_sell_limit:
             # For sell_limit: SL >= entry_price, TP <= entry_price
             if stop_loss and stop_loss < entry_price:
-                error_message = (
-                    f"Invalid stop-loss for {symbol} (sell_limit). "
-                    f"SL: {stop_loss}, must be >= {entry_price}"
+                # Adjust SL up to valid level
+                original_sl = stop_loss
+                stop_loss = entry_price  # Minimal adjustment
+                if abs(entry_price - stop_loss) < stops_level:
+                    error_message = (
+                        f"Cannot adjust SL for {symbol} (sell_limit) without violating stops_level. "
+                        f"Original SL: {original_sl}, Adjusted Entry: {entry_price}"
+                    )
+                    log_and_print(error_message, "ERROR")
+                    return False, None, error_message, "adjusted_risk_violation"
+                log_and_print(
+                    f"Adjusted invalid SL for {symbol} (sell_limit) from {original_sl} to {stop_loss}",
+                    "WARNING"
                 )
-                log_and_print(error_message, "ERROR")
-                return False, None, error_message, "stop_loss"
             if profit_price and profit_price > entry_price:
-                error_message = (
-                    f"Invalid take-profit for {symbol} (sell_limit). "
-                    f"TP: {profit_price}, must be <= {entry_price}"
+                profit_price = entry_price - stops_level  # Minimal valid TP
+                log_and_print(
+                    f"Adjusted invalid TP for {symbol} (sell_limit) to {profit_price} (min distance)",
+                    "WARNING"
                 )
-                log_and_print(error_message, "ERROR")
-                return False, None, error_message, "stop_loss"
-            # Check stop-loss distance
+            # Check distances (post-adjustment)
             if stop_loss and abs(entry_price - stop_loss) < stops_level:
                 error_message = (
-                    f"Stop-loss too close to entry price for {symbol}. "
+                    f"SL too close to adjusted entry for {symbol}. "
                     f"SL: {stop_loss}, Entry: {entry_price}, Distance: {abs(entry_price - stop_loss)}, "
                     f"Required: >= {stops_level}"
                 )
                 log_and_print(error_message, "ERROR")
                 return False, None, error_message, "stop_loss"
-            # Check take-profit distance (if applicable)
             if profit_price and abs(profit_price - entry_price) < stops_level:
                 error_message = (
-                    f"Take-profit too close to entry price for {symbol}. "
+                    f"TP too close to adjusted entry for {symbol}. "
                     f"TP: {profit_price}, Entry: {entry_price}, Distance: {abs(profit_price - entry_price)}, "
                     f"Required: >= {stops_level}"
                 )
                 log_and_print(error_message, "ERROR")
                 return False, None, error_message, "stop_loss"
 
-        # If all validations pass, mark as success without placing the order
+        # If all validations pass (post-adjustment), mark as success
+        adjustment_note = f" (entry adjusted from {original_entry} to {entry_price})" if adjustment_made else ""
         log_and_print(
-            f"Pending {order_type} order for {symbol} validated successfully at {entry_price} "
+            f"Pending {order_type} order for {symbol} validated successfully at {entry_price}{adjustment_note} "
             f"with TP {profit_price}, SL {stop_loss}, Allowed Risk={allowed_risk} (Order not sent as per request)",
             "SUCCESS"
         )
@@ -623,8 +650,8 @@ def place_pending_order(symbol, order_type, entry_price, profit_price, stop_loss
     except Exception as e:
         error_message = f"Error validating pending order for {symbol}: {str(e)}"
         log_and_print(error_message, "ERROR")
-        return False, None, error_message, "unknown"  
-
+        return False, None, error_message, "unknown"
+    
 def add_to_watchlist_and_place_orders():
     """Add market symbols from JSON to MT5 watchlist and validate pending orders based on JSON signals."""
     log_and_print("===== Adding Market Symbols to Watchlist and Validating Pending Orders =====", "TITLE")

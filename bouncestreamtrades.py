@@ -595,7 +595,10 @@ class ProgrammeFetcher:
         self.total_signals_loaded: int = 0
         self.total_failed_orders: int = 0
         self.total_alltimeframes_orders: int = 0  # New counter for alltimeframes orders
-        self.total_priority_timeframes_orders: int = 0  
+        self.total_priority_timeframes_orders: int = 0
+        self.total_skipped_running: int = 0
+        self.total_skipped_closed: int = 0
+        self.total_skipped_limit: int = 0
 
     def normalize_row(self, row: Dict) -> Dict:
         """Normalize row data to handle string 'None' values and ensure correct types."""
@@ -927,45 +930,192 @@ class ProgrammeFetcher:
         log_and_print(f"Closed trades processing complete: {removed_count} signals removed, {len(closed_to_add)} new closed trades added", "INFO")
         return removed_count
 
-    async def add_symbols_to_watchlist(self, account: Dict, terminal_path: str) -> bool:
-        """Add all available broker symbols to the MT5 Market Watch for the given account."""
-        account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
-        log_and_print(f"Adding symbols to Market Watch for {account_key}", "INFO")
+    async def removeclosedtrades(self, valid_accounts: List[Dict]) -> int:
+        """Check each account's trade history, match closed trades with bouncestream signals, remove matched signals from JSON, and append unique closed trades to allclosedorders.json."""
+        log_and_print("===== Removing Closed Trades from Bouncestream Signals =====", "TITLE")
 
-        # Initialize MT5 for the account
-        if not self.mt5_manager.initialize_mt5(
-            server=account['broker_server'],
-            login=account['broker_loginid'],
-            password=account['broker_password'],
-            terminal_path=terminal_path
-        ):
-            log_and_print(f"Failed to initialize MT5 for {account_key} to add symbols", "ERROR")
-            return False
+        signals_path = os.path.join(BASE_LOTSIZE_FOLDER, "bouncestreamsignals.json")
+        if not os.path.exists(signals_path):
+            log_and_print(f"Signals file not found: {signals_path}", "ERROR")
+            return 0
 
         try:
-            # Get all available symbols
-            symbols = thread_local.mt5.symbols_get()
-            if not symbols:
-                error_code, error_message = thread_local.mt5.last_error()
-                log_and_print(f"Failed to retrieve symbols for {account_key}. Error: {error_code}, {error_message}", "ERROR")
-                return False
-
-            log_and_print(f"Retrieved {len(symbols)} symbols for {account_key}", "INFO")
-
-            # Add each symbol to Market Watch
-            for symbol in symbols:
-                if not thread_local.mt5.symbol_select(symbol.name, True):
-                    error_code, error_message = thread_local.mt5.last_error()
-                    log_and_print(f"Failed to add symbol {symbol.name} to Market Watch for {account_key}. Error: {error_code}, {error_message}", "WARNING")
-                else:
-                    log_and_print(f"Added symbol {symbol.name} to Market Watch for {account_key}", "DEBUG")
-
-            log_and_print(f"Successfully added all symbols to Market Watch for {account_key}", "SUCCESS")
-            return True
-
+            with open(signals_path, 'r', encoding='utf-8') as f:
+                signals_data = json.load(f)
+            signals = signals_data['orders']
+            log_and_print(f"Loaded {len(signals)} signals from {signals_path}", "INFO")
         except Exception as e:
-            log_and_print(f"Exception while adding symbols for {account_key}: {str(e)}", "ERROR")
-            return False
+            log_and_print(f"Error loading signals from {signals_path}: {str(e)}", "ERROR")
+            return 0
+
+        if not signals:
+            log_and_print("No signals to process for closed trades", "INFO")
+            return 0
+
+        # Create signal key to index mapping for quick lookup and removal
+        signals_dict = {}
+        for idx, signal in enumerate(signals):
+            key = f"{signal['pair']}_{signal['order_type']}_{signal['entry_price']:.5f}"
+            signals_dict[key] = idx
+
+        # Closed trades path
+        closed_dir = os.path.join(BASE_LOTSIZE_FOLDER, "closedtrades")
+        closed_path = os.path.join(closed_dir, "allclosedorders.json")
+        os.makedirs(closed_dir, exist_ok=True)
+
+        # Load existing closed trades to check for duplicates
+        existing_closed = []
+        existing_closed_keys = set()
+        if os.path.exists(closed_path):
+            try:
+                with open(closed_path, 'r', encoding='utf-8') as f:
+                    existing_closed = json.load(f)
+                for closed_record in existing_closed:
+                    key = f"{closed_record['pair']}_{closed_record['order_type']}_{closed_record['entry_price']:.5f}"
+                    existing_closed_keys.add(key)
+                log_and_print(f"Loaded {len(existing_closed)} existing closed trades from {closed_path}", "INFO")
+            except Exception as e:
+                log_and_print(f"Error loading existing closed trades from {closed_path}: {str(e)}", "WARNING")
+                existing_closed = []
+
+        closed_to_add = []
+        indices_to_remove = set()
+
+        # Process each valid account
+        for account in valid_accounts:
+            user_id = account['user_id']
+            subaccount_id = account['subaccount_id']
+            account_type = "sa" if subaccount_id else "ma"
+            account_key = f"user_{user_id}_sub_{subaccount_id}" if subaccount_id else f"user_{user_id}"
+            terminal_path = self.config.create_account_terminal(user_id, account_type)
+            if not terminal_path:
+                log_and_print(f"Skipping closed trades check for {account_key}: Failed to create terminal", "WARNING")
+                continue
+
+            # Initialize MT5
+            if not self.mt5_manager.initialize_mt5(
+                server=account['broker_server'],
+                login=account['broker_loginid'],
+                password=account['broker_password'],
+                terminal_path=terminal_path
+            ):
+                log_and_print(f"Skipping closed trades check for {account_key}: MT5 initialization failed", "WARNING")
+                continue
+
+            # Get history deals for the last 5 days
+            from_date = datetime.now(timezone.utc) - timedelta(days=5)
+            to_date = datetime.now(timezone.utc)
+            history_deals = thread_local.mt5.history_deals_get(from_date, to_date)
+            if not history_deals:
+                log_and_print(f"No history deals found for {account_key}", "DEBUG")
+                continue
+
+            # Group deals by position_id
+            positions = defaultdict(list)
+            for deal in history_deals:
+                if deal.entry in [thread_local.mt5.DEAL_ENTRY_IN, thread_local.mt5.DEAL_ENTRY_OUT]:
+                    positions[deal.position_id].append(deal)
+
+            # Process each closed position
+            for pos_id, deals in positions.items():
+                if len(deals) < 2:
+                    continue
+                in_deals = [d for d in deals if d.entry == thread_local.mt5.DEAL_ENTRY_IN]
+                out_deals = [d for d in deals if d.entry == thread_local.mt5.DEAL_ENTRY_OUT]
+                if not in_deals or not out_deals:
+                    continue
+
+                open_deal = in_deals[0]
+                close_deal = out_deals[0]
+
+                if open_deal.symbol == '':
+                    continue
+
+                symbol = open_deal.symbol.lower()
+                deal_type = open_deal.type
+                if deal_type not in [thread_local.mt5.DEAL_TYPE_BUY, thread_local.mt5.DEAL_TYPE_SELL]:
+                    continue
+
+                order_type = 'buy_limit' if deal_type == thread_local.mt5.DEAL_TYPE_BUY else 'sell_limit'
+                entry_price = open_deal.price
+                key = f"{symbol}_{order_type}_{entry_price:.5f}"
+
+                if key in signals_dict:
+                    idx = signals_dict[key]
+                    if key not in existing_closed_keys:
+                        signal = signals[idx]
+                        closed_record = signal.copy()
+                        closed_record['close_time'] = datetime.fromtimestamp(close_deal.time, tz=timezone.utc).astimezone(pytz.timezone('Africa/Lagos')).isoformat()
+                        closed_record['close_price'] = close_deal.price
+                        closed_record['profit'] = close_deal.profit
+                        closed_record['close_timestamp'] = datetime.now(pytz.timezone('Africa/Lagos')).isoformat()
+                        closed_to_add.append(closed_record)
+                        existing_closed_keys.add(key)
+                        log_and_print(f"New closed trade matched for {key} in {account_key}", "INFO")
+
+                    indices_to_remove.add(idx)
+                    log_and_print(f"Matched and marking for removal: {key} from signals", "INFO")
+
+        # Remove matched signals (in reverse order to avoid index shifting)
+        removed_count = 0
+        for idx in sorted(indices_to_remove, reverse=True):
+            del signals[idx]
+            removed_count += 1
+
+        if removed_count > 0:
+            # Recalculate summary after removals
+            timeframe_counts = {
+                '5minutes': 0,
+                '15minutes': 0,
+                '30minutes': 0,
+                '1hour': 0,
+                '4hours': 0
+            }
+            for signal in signals:
+                timeframe = signal['timeframe'].lower().replace('4hour', '4hours')
+                if timeframe == '5minutes':
+                    timeframe_counts['5minutes'] += 1
+                elif timeframe == '15minutes':
+                    timeframe_counts['15minutes'] += 1
+                elif timeframe == '30minutes':
+                    timeframe_counts['30minutes'] += 1
+                elif timeframe == '1hour':
+                    timeframe_counts['1hour'] += 1
+                elif timeframe == '4hours':
+                    timeframe_counts['4hours'] += 1
+
+            signals_data['orders'] = signals
+            signals_data.update({
+                "bouncestream_pendingorders": len(signals),
+                "5minutes pending orders": timeframe_counts['5minutes'],
+                "15minutes pending orders": timeframe_counts['15minutes'],
+                "30minutes pending orders": timeframe_counts['30minutes'],
+                "1Hour pending orders": timeframe_counts['1hour'],
+                "4Hours pending orders": timeframe_counts['4hours'],
+            })
+
+            # Save updated signals
+            try:
+                with open(signals_path, 'w', encoding='utf-8') as f:
+                    json.dump(signals_data, f, indent=4)
+                os.chmod(signals_path, 0o666)
+                log_and_print(f"Updated signals saved to {signals_path} ({removed_count} signals removed)", "SUCCESS")
+            except Exception as e:
+                log_and_print(f"Error saving updated signals to {signals_path}: {str(e)}", "ERROR")
+
+            # Append new closed trades
+            if closed_to_add:
+                existing_closed.extend(closed_to_add)
+                try:
+                    with open(closed_path, 'w', encoding='utf-8') as f:
+                        json.dump(existing_closed, f, indent=4)
+                    os.chmod(closed_path, 0o666)
+                    log_and_print(f"Appended {len(closed_to_add)} unique closed trades to {closed_path}", "SUCCESS")
+                except Exception as e:
+                    log_and_print(f"Error saving closed trades to {closed_path}: {str(e)}", "ERROR")
+
+        log_and_print(f"Closed trades processing complete: {removed_count} signals removed, {len(closed_to_add)} new closed trades added", "INFO")
+        return removed_count
 
     async def batch_update_programme_startdate(self, programme_ids: List[str]) -> int:
         """Batch update programmetrade_startdate for programmes with successful orders if the date is NULL or empty."""
@@ -1250,6 +1400,101 @@ class ProgrammeFetcher:
         except Exception as e:
             log_and_print(f"Error saving failed order for {symbol} to {output_path}: {str(e)}", "ERROR")
 
+    # Modified check_for_duplicate function
+    def check_for_duplicate(self, account: Dict, server_symbol: str, json_symbol: str, order_type: str, entry_price: float) -> tuple[bool, str]:
+        """
+        Check if an order with the given symbol, order_type, and entry_price already exists as:
+        - A running position in MT5 or runningtrades.json
+        - A pending limit order in MT5
+        - A closed trade in closedtrades.json
+        
+        Returns (True, reason) if duplicate exists (skip placement), (False, 'none') otherwise.
+        Reason can be 'running', 'limit', or 'closed'.
+        """
+        account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
+        key = f"{json_symbol.lower()}_{order_type.lower()}_{entry_price:.5f}"
+        log_and_print(f"Checking for duplicate order for {account_key}: {key}", "DEBUG")
+
+        # Check 1: Existing running positions in MT5
+        try:
+            positions = thread_local.mt5.positions_get(symbol=server_symbol)
+            if positions:
+                pos_type = thread_local.mt5.ORDER_TYPE_BUY if 'buy' in order_type.lower() else thread_local.mt5.ORDER_TYPE_SELL
+                for pos in positions:
+                    if pos.type == pos_type and abs(pos.price_open - entry_price) < 0.0001:  # Tolerance for floating point
+                        log_and_print(f"Duplicate running position found in MT5 for {key} in {account_key}", "WARNING")
+                        return True, 'running'
+        except Exception as e:
+            log_and_print(f"Error checking MT5 positions for {account_key}: {str(e)}", "WARNING")
+
+        # Check 2: Existing pending limit orders in MT5
+        try:
+            pending_orders = thread_local.mt5.orders_get(symbol=server_symbol)
+            if pending_orders:
+                order_mt5_type = thread_local.mt5.ORDER_TYPE_BUY_LIMIT if 'buy_limit' in order_type.lower() else thread_local.mt5.ORDER_TYPE_SELL_LIMIT
+                for order in pending_orders:
+                    if order.type == order_mt5_type and abs(order.price_open - entry_price) < 0.0001:
+                        log_and_print(f"Duplicate pending order found in MT5 for {key} in {account_key}", "WARNING")
+                        return True, 'limit'
+        except Exception as e:
+            log_and_print(f"Error checking MT5 pending orders for {account_key}: {str(e)}", "WARNING")
+
+        # Check 3: Running trades in per-account JSON
+        running_file = os.path.join(self.config.running_trades_dir, f"{account_key}_runningtrades.json")
+        if os.path.exists(running_file):
+            try:
+                with open(running_file, 'r', encoding='utf-8') as f:
+                    running_trades = json.load(f)
+                if isinstance(running_trades, list):
+                    for trade in running_trades:
+                        try:
+                            trade_entry_price = float(trade.get('entry_price', 0))
+                            trade_key = f"{trade.get('pair', '').lower()}_{trade.get('order_type', '').lower()}_{trade_entry_price:.5f}"
+                            if trade_key == key:
+                                log_and_print(f"Duplicate running trade found in JSON for {key} in {account_key}", "WARNING")
+                                return True, 'running'
+                        except (ValueError, KeyError):
+                            log_and_print(f"Invalid trade data in running trades JSON for {account_key}", "DEBUG")
+                else:
+                    log_and_print(f"Running trades JSON for {account_key} is not a list, skipping", "DEBUG")
+            except json.JSONDecodeError as e:
+                log_and_print(f"Corrupted running trades JSON for {account_key}: {str(e)}. Skipping.", "DEBUG")
+            except Exception as e:
+                log_and_print(f"Error loading running trades JSON for {account_key}: {str(e)}", "WARNING")
+
+        # Check 4: Closed trades in per-account JSON
+        closed_file = os.path.join(self.config.closed_trades_dir, f"{account_key}_closedtrades.json")
+        if os.path.exists(closed_file):
+            try:
+                with open(closed_file, 'r', encoding='utf-8') as f:
+                    closed_trades = json.load(f)
+                if isinstance(closed_trades, list):
+                    for trade in closed_trades:
+                        try:
+                            trade_entry_price = float(trade.get('entry_price', 0))
+                            trade_key = f"{trade.get('pair', '').lower()}_{trade.get('order_type', '').lower()}_{trade_entry_price:.5f}"
+                            if trade_key == key:
+                                log_and_print(f"Duplicate closed trade found in JSON for {key} in {account_key}", "WARNING")
+                                return True, 'closed'
+                        except (ValueError, KeyError):
+                            log_and_print(f"Invalid trade data in closed trades JSON for {account_key}", "DEBUG")
+                else:
+                    log_and_print(f"Closed trades JSON for {account_key} is not a list, skipping", "DEBUG")
+            except json.JSONDecodeError as e:
+                log_and_print(f"Corrupted closed trades JSON for {account_key}: {str(e)}. Skipping and resetting file.", "DEBUG")
+                # Optionally reset the file to empty list
+                try:
+                    with open(closed_file, 'w', encoding='utf-8') as f:
+                        json.dump([], f, indent=4)
+                    log_and_print(f"Reset corrupted closed trades JSON for {account_key} to empty list", "INFO")
+                except Exception as reset_e:
+                    log_and_print(f"Failed to reset closed trades JSON for {account_key}: {str(reset_e)}", "WARNING")
+            except Exception as e:
+                log_and_print(f"Error loading closed trades JSON for {account_key}: {str(e)}", "WARNING")
+
+        log_and_print(f"No duplicate found for {key} in {account_key}, safe to place", "DEBUG")
+        return False, 'none'
+
     async def alltimeframesorder(self, account: Dict, terminal_path: str, signals: List[Dict], available_symbols: List[str]) -> tuple[int, int]:
         """Place one order per timeframe (15m, 30m, 1h, 4h) for each symbol if available, except M5 unless no other timeframes exist."""
         account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
@@ -1452,6 +1697,20 @@ class ProgrammeFetcher:
                         self.total_failed_orders += 1
                         continue
 
+                    # Check for duplicates before placing order
+                    is_duplicate, reason = self.check_for_duplicate(account, server_symbol, json_symbol, order_type, entry_price)
+                    if is_duplicate:
+                        error_message = f"Duplicate order detected for {json_symbol} ({order_type} at {entry_price}): {reason}"
+                        log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "WARNING")
+                        self.save_account_order_error(account_key, json_symbol, f"skips({reason})")
+                        if reason == 'running':
+                            self.total_skipped_running += 1
+                        elif reason == 'limit':
+                            self.total_skipped_limit += 1
+                        elif reason == 'closed':
+                            self.total_skipped_closed += 1
+                        continue
+
                     success, order_id, error_message, error_category = self.place_pending_order(
                         server_symbol, order_type, entry_price, profit_price, stop_loss, adjusted_lot_size, signal_allowed_risk
                     )
@@ -1462,7 +1721,7 @@ class ProgrammeFetcher:
                     else:
                         log_and_print(f"Failed to place order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
                         failed_symbols.append(json_symbol)
-                        self.save_account_order_error(account_key, server_symbol, error_message)
+                        self.save_account_order_error(account_key, server_symbol, f"fails({error_message})")
                         self.total_failed_orders += 1
                         self.save_failed_orders(
                             server_symbol, order_type, entry_price, profit_price, stop_loss,
@@ -1473,7 +1732,7 @@ class ProgrammeFetcher:
                     error_message = f"Error processing signal for {json_symbol} ({timeframe}): {str(e)}"
                     log_and_print(error_message, "ERROR")
                     failed_symbols.append(json_symbol)
-                    self.save_account_order_error(account_key, json_symbol, error_message)
+                    self.save_account_order_error(account_key, json_symbol, f"fails({error_message})")
                     self.total_failed_orders += 1
 
         # Log summary
@@ -2051,6 +2310,20 @@ class ProgrammeFetcher:
                                 self.total_failed_orders += 1
                                 continue
 
+                            # Check for duplicates before placing order
+                            is_duplicate, reason = self.check_for_duplicate(account, server_symbol, json_symbol, order_type, entry_price)
+                            if is_duplicate:
+                                error_message = f"Duplicate order detected for {json_symbol} ({order_type} at {entry_price}): {reason}"
+                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "WARNING")
+                                self.save_account_order_error(account_key, json_symbol, f"skips({reason})")
+                                if reason == 'running':
+                                    self.total_skipped_running += 1
+                                elif reason == 'limit':
+                                    self.total_skipped_limit += 1
+                                elif reason == 'closed':
+                                    self.total_skipped_closed += 1
+                                continue
+
                             success, order_id, error_message, error_category = self.place_pending_order(
                                 server_symbol, order_type, entry_price, profit_price, stop_loss, adjusted_lot_size, signal_allowed_risk
                             )
@@ -2061,7 +2334,7 @@ class ProgrammeFetcher:
                             else:
                                 log_and_print(f"Failed to place order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
                                 failed_symbols.append(json_symbol)
-                                self.save_account_order_error(account_key, server_symbol, error_message)
+                                self.save_account_order_error(account_key, server_symbol, f"fails({error_message})")
                                 self.total_failed_orders += 1
                                 self.save_failed_orders(
                                     server_symbol, order_type, entry_price, profit_price, stop_loss,
@@ -2072,7 +2345,7 @@ class ProgrammeFetcher:
                             error_message = f"Error processing signal for {json_symbol} ({timeframe}): {str(e)}"
                             log_and_print(error_message, "ERROR")
                             failed_symbols.append(json_symbol)
-                            self.save_account_order_error(account_key, json_symbol, error_message)
+                            self.save_account_order_error(account_key, json_symbol, f"fails({error_message})")
                             self.total_failed_orders += 1
 
                     # Mark signals as processed for this symbol and skip other timeframes
@@ -2165,12 +2438,14 @@ async def main():
     log_and_print(f"Total pending orders placed: {total_orders_placed}", "INFO" if total_orders_placed > 0 else "WARNING")
     log_and_print(f"Total Alltimeframes orders placed: {fetcher.total_alltimeframes_orders}", "INFO" if fetcher.total_alltimeframes_orders > 0 else "WARNING")
     log_and_print(f"Total Priority-timeframes orders placed: {fetcher.total_priority_timeframes_orders}", "INFO" if fetcher.total_priority_timeframes_orders > 0 else "WARNING")
+    log_and_print(f"Total skipped running orders: {fetcher.total_skipped_running}", "INFO")
+    log_and_print(f"Total skipped closed orders: {fetcher.total_skipped_closed}", "INFO")
+    log_and_print(f"Total skipped existing limit orders: {fetcher.total_skipped_limit}", "INFO")
     log_and_print(f"Total failed pending orders placed: {fetcher.total_failed_orders}", "INFO" if fetcher.total_failed_orders == 0 else "WARNING")
     log_and_print(f"Skipped records: {skipped_records}", "INFO")
 
     print("\n")
     log_and_print("===== Server Bouncestream Processing completed =====")
-
 
 if __name__ == "__main__":
     asyncio.run(main())

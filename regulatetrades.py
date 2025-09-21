@@ -46,7 +46,7 @@ RETRY_MAX_ATTEMPTS = 3
 RETRY_DELAY = 2
 MAX_RETRIES = 5
 MT5_RETRY_DELAY = 3
-CHECK_INTERVAL = 30  # Seconds to wait between trade regulation checks
+CHECK_INTERVAL = 10  # Seconds to wait between trade regulation checks
 SL_ADJUSTMENT_PERCENT = 0.10  # Stop-loss adjustment percentage for entry price
 SL_RR_05_PERCENT = 0.25  # Stop-loss adjustment percentage for 1:0.5 RR
 
