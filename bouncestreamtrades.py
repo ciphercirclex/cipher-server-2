@@ -594,8 +594,9 @@ class ProgrammeFetcher:
         self.processed_programme_ids: set[str] = set()
         self.total_signals_loaded: int = 0
         self.total_failed_orders: int = 0
-        self.total_alltimeframes_orders: int = 0  # New counter for alltimeframes orders
-        self.total_priority_timeframes_orders: int = 0
+        self.total_priority_lowtohigh_orders: int = 0
+        self.total_priority_hightolow_orders: int = 0
+        self.total_priority_timeframes_orders: int = 0  # Combined counter for both priority strategies
         self.total_skipped_running: int = 0
         self.total_skipped_closed: int = 0
         self.total_skipped_limit: int = 0
@@ -652,7 +653,7 @@ class ProgrammeFetcher:
         programme = self.config.validate_field('programme', programme, self.config.valid_programmes, 'programme')
         broker = self.config.validate_field('broker', broker, self.config.valid_brokers, 'broker')
         programme_timeframe = self.config.validate_field('programme_timeframe', programme_timeframe, 
-                                                        ['priority_timeframe', 'alltimeframes'], 'programme_timeframe')
+                                                        ['priority_lowtohigh_timeframe', 'priority_hightolow_timeframe'], 'programme_timeframe')
 
         if not all([programme, broker, programme_timeframe]):
             log_and_print(f"Skipping record: programme_id={programme_id}, invalid programme, broker, or programme_timeframe", "DEBUG")
@@ -681,6 +682,7 @@ class ProgrammeFetcher:
             'broker_server': broker_server,
             'programme_timeframe': programme_timeframe
         }
+
 
     async def fetch_user_programmes(self) -> Optional[List[Dict]]:
         """Fetch user programmes from the user_programmes table, including broker details and programme_timeframe."""
@@ -1495,14 +1497,25 @@ class ProgrammeFetcher:
         log_and_print(f"No duplicate found for {key} in {account_key}, safe to place", "DEBUG")
         return False, 'none'
 
+    # Updated alltimeframesorder function to respect programme_timeframe
     async def alltimeframesorder(self, account: Dict, terminal_path: str, signals: List[Dict], available_symbols: List[str]) -> tuple[int, int]:
         """Place one order per timeframe (15m, 30m, 1h, 4h) for each symbol if available, except M5 unless no other timeframes exist."""
         account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
-        log_and_print(f"===== Placing All-Timeframes Orders for {account_key} =====", "TITLE")
+        programme_timeframe = account.get('programme_timeframe', 'priority_lowtohigh_timeframe')
+        log_and_print(f"Using {programme_timeframe} order placement strategy for {account_key} in alltimeframesorder", "INFO")
 
-        # Define timeframe order (excluding M5 unless necessary)
-        timeframe_order = ['15minutes', '30minutes', '1hour', '4hours', '5minutes']
-        log_and_print(f"Timeframe order for alltimeframes: {', '.join(timeframe_order)}", "INFO")
+        # Define timeframe priorities separately based on strategy
+        if programme_timeframe == 'priority_lowtohigh_timeframe':
+            timeframe_priority = ['15minutes', '30minutes', '1hour', '4hours', '5minutes']
+            log_and_print(f"Timeframe priority order (low-to-high): {', '.join(timeframe_priority)}", "INFO")
+        elif programme_timeframe == 'priority_hightolow_timeframe':
+            timeframe_priority = ['4hours', '1hour', '30minutes', '15minutes', '5minutes']
+            log_and_print(f"Timeframe priority order (high-to-low): {', '.join(timeframe_priority)}", "INFO")
+        else:
+            log_and_print(f"Unknown programme_timeframe '{programme_timeframe}', defaulting to low-to-high", "WARNING")
+            timeframe_priority = ['15minutes', '30minutes', '1hour', '4hours', '5minutes']
+
+        log_and_print(f"===== Placing All-Timeframes Orders for {account_key} =====", "TITLE")
 
         # Initialize MT5 for the account
         for attempt in range(1, MAX_RETRIES + 1):
@@ -1648,8 +1661,8 @@ class ProgrammeFetcher:
             # Check if any non-M5 timeframes exist
             has_non_m5 = any(tf in signals_by_timeframe for tf in ['15minutes', '30minutes', '1hour', '4hours'])
 
-            # Process one order per timeframe (15m, 30m, 1h, 4h), or M5 only if no others
-            for timeframe in timeframe_order:
+            # Process one order per timeframe in priority order, skipping M5 if non-M5 available
+            for timeframe in timeframe_priority:
                 if timeframe == '5minutes' and has_non_m5:
                     log_and_print(f"Skipping M5 orders for {json_symbol} as other timeframes are available", "INFO")
                     continue
@@ -2108,22 +2121,27 @@ class ProgrammeFetcher:
         except Exception as e:
             log_and_print(f"Error saving to {output_path}: {str(e)}", "ERROR")
 
+    # Updated place_orders_for_account function (already handles priorities correctly, but ensuring separate definitions for clarity)
     async def place_orders_for_account(self, account: Dict, terminal_path: str, signals: List[Dict], available_symbols: List[str]) -> tuple[int, int]:
-        """Place pending orders for a valid account based on provided signals, using priority_timeframe or alltimeframes logic."""
-        programme_timeframe = account.get('programme_timeframe', 'priority_timeframe')
+        """Place pending orders for a valid account based on provided signals, using priority_timeframe logic (low-to-high or high-to-low).
+        Modified to place one buy and one sell per symbol across timeframes, preferring both from the same timeframe if possible and far apart (>= 30 pips).
+        If only one available in a timeframe, place it and seek the opposite in subsequent timeframes if distance allows."""
+        programme_timeframe = account.get('programme_timeframe', 'priority_lowtohigh_timeframe')
         log_and_print(f"Using {programme_timeframe} order placement strategy for account", "INFO")
 
-        if programme_timeframe == 'alltimeframes':
-            symbols_added, orders_placed = await self.alltimeframesorder(account, terminal_path, signals, available_symbols)
-            return symbols_added, orders_placed
-        
-        # Original priority_timeframe logic
+        # Define timeframe priorities separately based on strategy
+        if programme_timeframe == 'priority_lowtohigh_timeframe':
+            timeframe_priority = ['15minutes', '30minutes', '1hour', '4hours', '5minutes']
+            log_and_print(f"Timeframe priority order (low-to-high): {', '.join(timeframe_priority)}", "INFO")
+        elif programme_timeframe == 'priority_hightolow_timeframe':
+            timeframe_priority = ['4hours', '1hour', '30minutes', '15minutes', '5minutes']
+            log_and_print(f"Timeframe priority order (high-to-low): {', '.join(timeframe_priority)}", "INFO")
+        else:
+            log_and_print(f"Unknown programme_timeframe '{programme_timeframe}', defaulting to low-to-high", "WARNING")
+            timeframe_priority = ['15minutes', '30minutes', '1hour', '4hours', '5minutes']
+
         account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
         log_and_print(f"===== Placing Priority-Timeframe Orders for {account_key} =====", "TITLE")
-
-        # Define timeframe priority order
-        timeframe_priority = ['15minutes', '4hours', '1hour', '30minutes', '5minutes']
-        log_and_print(f"Timeframe priority order: {', '.join(timeframe_priority)}", "INFO")
 
         # Initialize MT5 for the account
         for attempt in range(1, MAX_RETRIES + 1):
@@ -2246,14 +2264,25 @@ class ProgrammeFetcher:
             if signal_allowed_risk in allowed_risk_levels:
                 symbol_signals[symbol].append(signal)
 
-        # Step 3: Process signals per symbol, respecting timeframe priority
+        # Step 3: Process signals per symbol, respecting timeframe priority with buy/sell pairing logic
         for json_symbol in unique_symbols:
             server_symbol = self.get_exact_symbol_match(json_symbol, available_symbols)
             if server_symbol is None or server_symbol not in added_symbols:
                 log_and_print(f"Skipping orders for {json_symbol} (server: {server_symbol}) as it was not added to Market Watch", "WARNING")
                 continue
 
-            log_and_print(f"Processing orders for symbol {json_symbol} (server: {server_symbol})", "INFO")
+            # Get symbol info for min_distance calculation
+            symbol_info = thread_local.mt5.symbol_info(server_symbol)
+            if symbol_info is None:
+                error_message = f"Cannot retrieve symbol info for {server_symbol}"
+                log_and_print(f"Skipping {json_symbol} for {account_key}: {error_message}", "ERROR")
+                failed_symbols.append(json_symbol)
+                self.save_account_order_error(account_key, json_symbol, error_message)
+                continue
+            point = symbol_info.point
+            min_distance = 300 * point  # 30 pips (assuming 5-digit broker, pip = 10 * point)
+
+            log_and_print(f"Processing orders for symbol {json_symbol} (server: {server_symbol}), min_distance: {min_distance}", "INFO")
 
             # Get signals for this symbol
             symbol_specific_signals = symbol_signals.get(json_symbol.lower(), [])
@@ -2266,95 +2295,114 @@ class ProgrammeFetcher:
                     signals_by_timeframe[timeframe] = []
                 signals_by_timeframe[timeframe].append(signal)
 
-            # Process signals based on timeframe priority
-            signals_processed = False
+            # Initialize placed entries
+            placed_buy_entry = None
+            placed_sell_entry = None
+            both_from_same_tf = False
+
+            # Process timeframes in priority order
             for timeframe in timeframe_priority:
                 normalized_timeframe = timeframe.lower().replace('4hour', '4hours')
-                if normalized_timeframe in signals_by_timeframe:
-                    log_and_print(f"Found {len(signals_by_timeframe[normalized_timeframe])} signals for {json_symbol} on {timeframe}, processing...", "INFO")
-                    for signal in signals_by_timeframe[normalized_timeframe]:
-                        try:
-                            signal_allowed_risk = float(signal.get('allowed_risk', 0.0)) if signal.get('allowed_risk') is not None else 0.0
-                            if signal_allowed_risk not in allowed_risk_levels:
-                                error_message = f"Signal risk {signal_allowed_risk} not allowed for account balance {balance}"
-                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "WARNING")
-                                self.save_account_order_error(account_key, json_symbol, error_message)
-                                self.total_failed_orders += 1
-                                continue
+                if normalized_timeframe not in signals_by_timeframe:
+                    log_and_print(f"No signals for {json_symbol} on {timeframe}", "INFO")
+                    continue
 
-                            order_type = signal['order_type']
-                            entry_price = signal['entry_price']
-                            profit_price = signal['profit_price'] if signal['profit_price'] else None
-                            stop_loss = signal['exit_price'] if signal['exit_price'] else None
-                            lot_size = signal['lot_size']
-                            multiplier = risk_multipliers.get(signal_allowed_risk, 1)
-                            adjusted_lot_size = float(lot_size) * multiplier
+                tf_signals = signals_by_timeframe[normalized_timeframe]
+                buys = [s for s in tf_signals if s['order_type'].lower() == 'buy_limit']
+                sells = [s for s in tf_signals if s['order_type'].lower() == 'sell_limit']
 
-                            # Pre-validate signal data
-                            if not all([json_symbol, order_type, entry_price, lot_size]):
-                                error_message = "Invalid signal data: Missing required fields"
-                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
-                                self.save_account_order_error(account_key, json_symbol, error_message)
-                                self.total_failed_orders += 1
-                                continue
-                            if order_type not in ['buy_limit', 'sell_limit']:
-                                error_message = f"Unsupported order type {order_type}"
-                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
-                                self.save_account_order_error(account_key, json_symbol, error_message)
-                                self.total_failed_orders += 1
-                                continue
-                            if adjusted_lot_size <= 0.0:
-                                error_message = f"Invalid adjusted lot size {adjusted_lot_size} (original: {lot_size}, multiplier: {multiplier})"
-                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
-                                self.save_account_order_error(account_key, json_symbol, error_message)
-                                self.total_failed_orders += 1
-                                continue
+                candidates_buy = buys if placed_buy_entry is None else []
+                candidates_sell = sells if placed_sell_entry is None else []
 
-                            # Check for duplicates before placing order
-                            is_duplicate, reason = self.check_for_duplicate(account, server_symbol, json_symbol, order_type, entry_price)
-                            if is_duplicate:
-                                error_message = f"Duplicate order detected for {json_symbol} ({order_type} at {entry_price}): {reason}"
-                                log_and_print(f"Skipping order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "WARNING")
-                                self.save_account_order_error(account_key, json_symbol, f"skips({reason})")
-                                if reason == 'running':
-                                    self.total_skipped_running += 1
-                                elif reason == 'limit':
-                                    self.total_skipped_limit += 1
-                                elif reason == 'closed':
-                                    self.total_skipped_closed += 1
-                                continue
+                # Case 1: This timeframe has candidates for both (none placed yet)
+                if candidates_buy and candidates_sell:
+                    buy_sig = candidates_buy[0]
+                    sell_sig = candidates_sell[0]
+                    buy_entry = buy_sig['entry_price']
+                    sell_entry = sell_sig['entry_price']
+                    if abs(buy_entry - sell_entry) >= min_distance:
+                        log_and_print(f"Placing both buy and sell from {timeframe} for {json_symbol} (dist: {abs(buy_entry - sell_entry)} >= {min_distance})", "INFO")
 
-                            success, order_id, error_message, error_category = self.place_pending_order(
-                                server_symbol, order_type, entry_price, profit_price, stop_loss, adjusted_lot_size, signal_allowed_risk
-                            )
-                            if success:
-                                pending_orders_placed.append((server_symbol, order_id, order_type, entry_price, profit_price, stop_loss, signal_allowed_risk, multiplier))
-                                self.total_priority_timeframes_orders += 1  # Increment priority timeframes counter
-                                log_and_print(f"Order placed for {json_symbol} ({timeframe}) for {account_key}: {order_type} at {entry_price}, lot_size={adjusted_lot_size} (multiplier={multiplier})", "SUCCESS")
+                        # Place buy
+                        buy_success, buy_order_id, buy_error, buy_category = await self._place_single_order(
+                            account, server_symbol, json_symbol, buy_sig, risk_multipliers, min_distance
+                        )
+                        if buy_success:
+                            placed_buy_entry = buy_entry
+                            pending_orders_placed.append((server_symbol, buy_order_id, buy_sig['order_type'], buy_entry, buy_sig.get('profit_price'), buy_sig.get('exit_price'), float(buy_sig.get('allowed_risk', 0.0)), risk_multipliers.get(float(buy_sig.get('allowed_risk', 0.0)), 1)))
+                            self.total_priority_timeframes_orders += 1
+                            if programme_timeframe == 'priority_lowtohigh_timeframe':
+                                self.total_priority_lowtohigh_orders += 1
                             else:
-                                log_and_print(f"Failed to place order for {json_symbol} ({timeframe}) for {account_key}: {error_message}", "ERROR")
-                                failed_symbols.append(json_symbol)
-                                self.save_account_order_error(account_key, server_symbol, f"fails({error_message})")
-                                self.total_failed_orders += 1
-                                self.save_failed_orders(
-                                    server_symbol, order_type, entry_price, profit_price, stop_loss,
-                                    adjusted_lot_size, signal_allowed_risk, error_message, error_category
-                                )
+                                self.total_priority_hightolow_orders += 1
+                            log_and_print(f"Buy order placed for {json_symbol} ({timeframe}) for {account_key}", "SUCCESS")
 
-                        except Exception as e:
-                            error_message = f"Error processing signal for {json_symbol} ({timeframe}): {str(e)}"
-                            log_and_print(error_message, "ERROR")
-                            failed_symbols.append(json_symbol)
-                            self.save_account_order_error(account_key, json_symbol, f"fails({error_message})")
-                            self.total_failed_orders += 1
+                        # Place sell
+                        sell_success, sell_order_id, sell_error, sell_category = await self._place_single_order(
+                            account, server_symbol, json_symbol, sell_sig, risk_multipliers, min_distance
+                        )
+                        if sell_success:
+                            placed_sell_entry = sell_entry
+                            pending_orders_placed.append((server_symbol, sell_order_id, sell_sig['order_type'], sell_entry, sell_sig.get('profit_price'), sell_sig.get('exit_price'), float(sell_sig.get('allowed_risk', 0.0)), risk_multipliers.get(float(sell_sig.get('allowed_risk', 0.0)), 1)))
+                            self.total_priority_timeframes_orders += 1
+                            if programme_timeframe == 'priority_lowtohigh_timeframe':
+                                self.total_priority_lowtohigh_orders += 1
+                            else:
+                                self.total_priority_hightolow_orders += 1
+                            log_and_print(f"Sell order placed for {json_symbol} ({timeframe}) for {account_key}", "SUCCESS")
 
-                    # Mark signals as processed for this symbol and skip other timeframes
-                    signals_processed = True
-                    log_and_print(f"Completed processing {timeframe} signals for {json_symbol}, skipping other timeframes", "INFO")
+                        both_from_same_tf = True
+                        break  # Skip other timeframes
+                    else:
+                        log_and_print(f"Buy and sell too close in {timeframe} for {json_symbol}: dist {abs(buy_entry - sell_entry)} < {min_distance}, skipping TF", "WARNING")
+                        continue
+
+                # Case 2: Place candidate buy if available (no dist check needed yet)
+                if candidates_buy:
+                    buy_sig = candidates_buy[0]
+                    buy_success, buy_order_id, buy_error, buy_category = await self._place_single_order(
+                        account, server_symbol, json_symbol, buy_sig, risk_multipliers, min_distance
+                    )
+                    if buy_success:
+                        placed_buy_entry = buy_sig['entry_price']
+                        pending_orders_placed.append((server_symbol, buy_order_id, buy_sig['order_type'], buy_sig['entry_price'], buy_sig.get('profit_price'), buy_sig.get('exit_price'), float(buy_sig.get('allowed_risk', 0.0)), risk_multipliers.get(float(buy_sig.get('allowed_risk', 0.0)), 1)))
+                        self.total_priority_timeframes_orders += 1
+                        if programme_timeframe == 'priority_lowtohigh_timeframe':
+                            self.total_priority_lowtohigh_orders += 1
+                        else:
+                            self.total_priority_hightolow_orders += 1
+                        log_and_print(f"Buy order placed for {json_symbol} ({timeframe}) for {account_key}", "SUCCESS")
+
+                # Case 3: Place candidate sell if available
+                if candidates_sell:
+                    sell_sig = candidates_sell[0]
+                    sell_entry = sell_sig['entry_price']
+                    dist_ok = True
+                    if placed_buy_entry is not None:
+                        if abs(placed_buy_entry - sell_entry) < min_distance:
+                            dist_ok = False
+                            log_and_print(f"Sell too close to placed buy in {timeframe} for {json_symbol}: dist {abs(placed_buy_entry - sell_entry)} < {min_distance}, skipping", "WARNING")
+
+                    if dist_ok:
+                        sell_success, sell_order_id, sell_error, sell_category = await self._place_single_order(
+                            account, server_symbol, json_symbol, sell_sig, risk_multipliers, min_distance
+                        )
+                        if sell_success:
+                            placed_sell_entry = sell_entry
+                            pending_orders_placed.append((server_symbol, sell_order_id, sell_sig['order_type'], sell_entry, sell_sig.get('profit_price'), sell_sig.get('exit_price'), float(sell_sig.get('allowed_risk', 0.0)), risk_multipliers.get(float(sell_sig.get('allowed_risk', 0.0)), 1)))
+                            self.total_priority_timeframes_orders += 1
+                            if programme_timeframe == 'priority_lowtohigh_timeframe':
+                                self.total_priority_lowtohigh_orders += 1
+                            else:
+                                self.total_priority_hightolow_orders += 1
+                            log_and_print(f"Sell order placed for {json_symbol} ({timeframe}) for {account_key}", "SUCCESS")
+
+                # If both placed now, break
+                if placed_buy_entry is not None and placed_sell_entry is not None:
                     break
 
-                if not signals_processed:
-                    log_and_print(f"No valid signals found for {json_symbol} in any priority timeframe", "WARNING")
+            if placed_buy_entry is None and placed_sell_entry is None:
+                log_and_print(f"No valid buy/sell orders placed for {json_symbol}", "WARNING")
 
         # Log summary
         log_and_print(f"===== Priority-Timeframe Order Placement Summary for {account_key} =====", "TITLE")
@@ -2372,6 +2420,69 @@ class ProgrammeFetcher:
         log_and_print(f"Total: {len(added_symbols)} symbols added, {len(set(failed_symbols))} failed, {len(pending_orders_placed)} pending orders placed", "INFO")
 
         return len(added_symbols), len(pending_orders_placed)
+
+    async def _place_single_order(self, account: Dict, server_symbol: str, json_symbol: str, signal: Dict, risk_multipliers: Dict, min_distance: float) -> tuple[bool, Optional[int], Optional[str], Optional[str]]:
+        """Helper method to place a single order with all validations, duplicate checks, etc."""
+        account_key = f"user_{account['user_id']}_sub_{account['subaccount_id']}" if account['subaccount_id'] else f"user_{account['user_id']}"
+        order_type = signal['order_type']
+        entry_price = signal['entry_price']
+        profit_price = signal['profit_price'] if signal['profit_price'] else None
+        stop_loss = signal['exit_price'] if signal['exit_price'] else None
+        lot_size = signal['lot_size']
+        signal_allowed_risk = float(signal.get('allowed_risk', 0.0)) if signal.get('allowed_risk') is not None else 0.0
+        multiplier = risk_multipliers.get(signal_allowed_risk, 1)
+        adjusted_lot_size = float(lot_size) * multiplier
+
+        # Pre-validate signal data
+        if not all([json_symbol, order_type, entry_price, lot_size]):
+            error_message = "Invalid signal data: Missing required fields"
+            log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+            self.save_account_order_error(account_key, json_symbol, error_message)
+            self.total_failed_orders += 1
+            return False, None, error_message, "unknown"
+        if order_type not in ['buy_limit', 'sell_limit']:
+            error_message = f"Unsupported order type {order_type}"
+            log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+            self.save_account_order_error(account_key, json_symbol, error_message)
+            self.total_failed_orders += 1
+            return False, None, error_message, "unknown"
+        if adjusted_lot_size <= 0.0:
+            error_message = f"Invalid adjusted lot size {adjusted_lot_size} (original: {lot_size}, multiplier: {multiplier})"
+            log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+            self.save_account_order_error(account_key, json_symbol, error_message)
+            self.total_failed_orders += 1
+            return False, None, error_message, "unknown"
+
+        # Check for duplicates before placing order
+        is_duplicate, reason = self.check_for_duplicate(account, server_symbol, json_symbol, order_type, entry_price)
+        if is_duplicate:
+            error_message = f"Duplicate order detected for {json_symbol} ({order_type} at {entry_price}): {reason}"
+            log_and_print(f"Skipping order for {json_symbol} for {account_key}: {error_message}", "WARNING")
+            self.save_account_order_error(account_key, json_symbol, f"skips({reason})")
+            if reason == 'running':
+                self.total_skipped_running += 1
+            elif reason == 'limit':
+                self.total_skipped_limit += 1
+            elif reason == 'closed':
+                self.total_skipped_closed += 1
+            return False, None, error_message, "duplicate"
+
+        # Place the order
+        success, order_id, error_message, error_category = self.place_pending_order(
+            server_symbol, order_type, entry_price, profit_price, stop_loss, adjusted_lot_size, signal_allowed_risk
+        )
+        if not success:
+            log_and_print(f"Failed to place order for {json_symbol} for {account_key}: {error_message}", "ERROR")
+            self.save_account_order_error(account_key, server_symbol, f"fails({error_message})")
+            self.total_failed_orders += 1
+            self.save_failed_orders(
+                server_symbol, order_type, entry_price, profit_price, stop_loss,
+                adjusted_lot_size, signal_allowed_risk, error_message, error_category
+            )
+        else:
+            log_and_print(f"Order placed for {json_symbol} for {account_key}: {order_type} at {entry_price}, lot_size={adjusted_lot_size} (multiplier={multiplier})", "SUCCESS")
+
+        return success, order_id, error_message, error_category
 
 async def main():
     """Main function to fetch lot size/risk data, bouncestream signals, initialize MT5, add symbols to watchlist, and place orders for bouncestream accounts."""
@@ -2436,7 +2547,8 @@ async def main():
     log_and_print(f"Total accounts with pending orders placed: {accounts_with_orders}", "INFO" if accounts_with_orders > 0 else "WARNING")
     log_and_print(f"Total pending orders loaded: {fetcher.total_signals_loaded}", "INFO")
     log_and_print(f"Total pending orders placed: {total_orders_placed}", "INFO" if total_orders_placed > 0 else "WARNING")
-    log_and_print(f"Total Alltimeframes orders placed: {fetcher.total_alltimeframes_orders}", "INFO" if fetcher.total_alltimeframes_orders > 0 else "WARNING")
+    log_and_print(f"Total Priority-lowtohigh_timeframes orders placed: {fetcher.total_priority_lowtohigh_orders}", "INFO" if fetcher.total_priority_lowtohigh_orders > 0 else "WARNING")
+    log_and_print(f"Total Priority-hightolow_timeframes orders placed: {fetcher.total_priority_hightolow_orders}", "INFO" if fetcher.total_priority_hightolow_orders > 0 else "WARNING")
     log_and_print(f"Total Priority-timeframes orders placed: {fetcher.total_priority_timeframes_orders}", "INFO" if fetcher.total_priority_timeframes_orders > 0 else "WARNING")
     log_and_print(f"Total skipped running orders: {fetcher.total_skipped_running}", "INFO")
     log_and_print(f"Total skipped closed orders: {fetcher.total_skipped_closed}", "INFO")
@@ -2446,6 +2558,9 @@ async def main():
 
     print("\n")
     log_and_print("===== Server Bouncestream Processing completed =====")
+
+
+
 
 if __name__ == "__main__":
     asyncio.run(main())

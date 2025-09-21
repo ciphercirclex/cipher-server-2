@@ -426,7 +426,7 @@ class TradeRegulator:
         programme = self.config.validate_field('programme', programme, self.config.valid_programmes, 'programme')
         broker = self.config.validate_field('broker', broker, self.config.valid_brokers, 'broker')
         programme_timeframe = self.config.validate_field('programme_timeframe', programme_timeframe, 
-                                                        ['priority_timeframe', 'alltimeframes'], 'programme_timeframe')
+                                                        ['priority_lowtohigh_timeframe', 'priority_hightolow_timeframe'], 'programme_timeframe')
 
         if not all([programme, broker, programme_timeframe]):
             log_and_print(f"Skipping record: programme_id={programme_id}, invalid programme, broker, or programme_timeframe", "DEBUG")
@@ -456,6 +456,7 @@ class TradeRegulator:
             'programme_timeframe': programme_timeframe,
             'terminal_path': self.config.create_account_terminal(user_id, "sa" if subaccount_id else "ma")
         }
+
 
     async def fetch_user_programmes(self) -> Optional[List[Dict]]:
         """Fetch user programmes from the user_programmes table."""
